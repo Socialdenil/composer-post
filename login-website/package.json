@@ -1,0 +1,15 @@
+{
+  "name": "composer-post",
+  "version": "1.0.0",
+  "description": "Composer Post - X Video Card & Redirect Post Generator Web Application",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": ["composer-post", "x", "twitter", "video-card", "redirect"],
+  "author": "",
+  "license": "MIT"
+}

@@ -1,0 +1,367 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>X Video Post Generator (Chrome Profile Auto-Sync)</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+        :root {
+            --bg-body: #0b0f17;
+            --bg-card: #151d2a;
+            --bg-input: #1e293b;
+            --border-color: rgba(255, 255, 255, 0.1);
+            --accent-blue: #1d9bf0;
+            --accent-purple: #7856ff;
+            --accent-emerald: #10b981;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --x-bg: #000000;
+            --x-border: #2f3336;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-body);
+            color: var(--text-primary);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .app-top-header {
+            max-width: 1200px;
+            margin: 0 auto 24px auto;
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+        }
+
+        .brand-header-title {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            font-size: 18px;
+            font-weight: 800;
+            background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .account-pill {
+            background: rgba(16, 185, 129, 0.15);
+            border: 1px solid var(--accent-emerald);
+            color: #6ee7b7;
+            padding: 8px 18px;
+            border-radius: 9999px;
+            font-size: 13px;
+            font-weight: 700;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1200px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 900px) {
+            .container { grid-template-columns: 1fr; }
+        }
+
+        .panel {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 20px;
+            padding: 28px;
+            box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+        }
+
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border-color);
+        }
+
+        .panel-title {
+            font-size: 18px;
+            font-weight: 800;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .form-group { margin-bottom: 18px; }
+
+        .form-group label {
+            display: block;
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            text-transform: uppercase;
+        }
+
+        .form-control {
+            width: 100%;
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            color: var(--text-primary);
+            padding: 12px 16px;
+            font-size: 14px;
+        }
+
+        textarea.form-control { resize: vertical; min-height: 90px; }
+
+        .btn-action {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: #fff;
+            border: none;
+            border-radius: 12px;
+            padding: 16px 20px;
+            font-size: 15px;
+            font-weight: 800;
+            cursor: pointer;
+            width: 100%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            margin-top: 14px;
+            box-shadow: 0 4px 16px rgba(16, 185, 129, 0.3);
+            transition: all 0.2s;
+        }
+
+        .btn-action:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 24px rgba(16, 185, 129, 0.4);
+        }
+
+        .tweet-card-preview {
+            background: var(--x-bg);
+            border: 1px solid var(--x-border);
+            border-radius: 16px;
+            padding: 16px;
+            color: #e7e9ea;
+        }
+
+        .tweet-header { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+        .avatar { width: 44px; height: 44px; border-radius: 50%; object-fit: cover; }
+        .name-row { display: flex; align-items: center; gap: 4px; font-weight: 700; font-size: 15px; }
+        .verified-icon { color: var(--accent-blue); font-size: 14px; }
+        .handle-row { color: #71767b; font-size: 14px; }
+        .tweet-body-text { font-size: 15px; line-height: 1.4; margin-bottom: 12px; white-space: pre-wrap; }
+
+        .video-card-container {
+            border: 1px solid var(--x-border);
+            border-radius: 16px;
+            overflow: hidden;
+            background: #000;
+            cursor: pointer;
+        }
+
+        .video-wrapper { position: relative; width: 100%; background: #000; display: flex; justify-content: center; }
+        .video-wrapper video { width: 100%; max-height: 360px; object-fit: contain; }
+        .play-icon-badge {
+            position: absolute;
+            width: 56px; height: 56px; border-radius: 50%;
+            background: rgba(29, 155, 240, 0.9);
+            color: #fff; display: flex; align-items: center; justify-content: center; font-size: 20px;
+        }
+
+        .card-footer-info { padding: 12px 14px; background: #16181c; border-top: 1px solid var(--x-border); }
+        .card-headline { font-size: 14px; font-weight: 700; color: #f7f9f9; margin-bottom: 4px; }
+        .card-domain { font-size: 13px; color: #71767b; }
+    </style>
+</head>
+<body>
+
+    <header class="app-top-header">
+        <div class="brand-header-title">
+            <i class="fa-brands fa-x-twitter" style="font-size: 24px; color: var(--accent-blue);"></i>
+            <span>X Video Post Generator & Auto-Publisher</span>
+        </div>
+
+        <div id="chromeAccountBadge" class="account-pill">
+            <i class="fa-solid fa-circle-check"></i>
+            <span>Chrome Profile X Account: <strong id="detectedHandle">@castellanclub</strong></span>
+        </div>
+    </header>
+
+    <div class="container">
+
+        <div class="panel">
+            <div class="panel-header">
+                <h2 class="panel-title">
+                    <i class="fa-solid fa-sliders"></i>
+                    Post Details & Target Link
+                </h2>
+            </div>
+
+            <form id="postForm">
+                <div class="form-group">
+                    <label>Post Text Caption:</label>
+                    <textarea id="captionInput" class="form-control">PSA for the gays: a THRUSTING prostate massager exists and it changed my whole solo routine 👀🔥 it literally moves for you. quiet, waterproof, body-safe. run don't walk 👉</textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>Product Headline / Title:</label>
+                    <input type="text" id="titleInput" class="form-control" value="PowerPulse Thrust Pro - Anal Expansion Prostate Massager">
+                </div>
+
+                <div class="form-group">
+                    <label>Destination Link (Click Redirect):</label>
+                    <input type="url" id="targetUrlInput" class="form-control" value="https://himhive.shop">
+                </div>
+
+                <div class="form-group">
+                    <label>Video URL or MP4 File:</label>
+                    <input type="text" id="videoUrlInput" class="form-control" placeholder="https://yourdomain.com/video.mp4">
+                    <input type="file" id="videoFileInput" accept="video/*" style="margin-top: 8px; font-size: 12px; color: var(--text-secondary);">
+                </div>
+
+                <button type="button" id="publishDirectBtn" class="btn-action">
+                    <i class="fa-solid fa-paper-plane"></i>
+                    🚀 Directly Post Video Tweet to <span id="btnHandleText">@castellanclub</span>
+                </button>
+            </form>
+        </div>
+
+        <div class="panel">
+            <div class="panel-header">
+                <h2 class="panel-title">
+                    <i class="fa-solid fa-eye"></i>
+                    Live X Feed Preview
+                </h2>
+            </div>
+
+            <div class="tweet-card-preview">
+                <div class="tweet-header">
+                    <img id="prevAvatar" class="avatar" src="https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80" alt="Avatar">
+                    <div class="user-names">
+                        <div class="name-row">
+                            <span id="prevName">jacboy</span>
+                            <i class="fa-solid fa-circle-check verified-icon"></i>
+                        </div>
+                        <div class="handle-row" id="prevHandle">@castellanclub · Oct 1</div>
+                    </div>
+                </div>
+
+                <div class="tweet-body-text" id="prevCaption"></div>
+
+                <div class="video-card-container" id="videoCardRedirect">
+                    <div class="video-wrapper">
+                        <video id="prevVideo" controls playsinline>
+                            <source src="" type="video/mp4">
+                        </video>
+                        <div class="play-icon-badge"><i class="fa-solid fa-play"></i></div>
+                    </div>
+                    <div class="card-footer-info">
+                        <div class="card-headline" id="prevTitle"></div>
+                        <div class="card-domain" id="prevDomain"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        const captionInput = document.getElementById('captionInput');
+        const titleInput = document.getElementById('titleInput');
+        const targetUrlInput = document.getElementById('targetUrlInput');
+        const videoUrlInput = document.getElementById('videoUrlInput');
+        const videoFileInput = document.getElementById('videoFileInput');
+
+        const prevCaption = document.getElementById('prevCaption');
+        const prevTitle = document.getElementById('prevTitle');
+        const prevDomain = document.getElementById('prevDomain');
+        const prevVideo = document.getElementById('prevVideo');
+        const videoCardRedirect = document.getElementById('videoCardRedirect');
+
+        const detectedHandle = document.getElementById('detectedHandle');
+        const btnHandleText = document.getElementById('btnHandleText');
+        const publishDirectBtn = document.getElementById('publishDirectBtn');
+
+        function autoDetectChromeProfileAccount() {
+            let activeHandle = localStorage.getItem('chrome_active_x_handle') || '@castellanclub';
+            updateAccountDisplay(activeHandle);
+        }
+
+        function updateAccountDisplay(handle) {
+            detectedHandle.innerText = handle;
+            btnHandleText.innerText = handle;
+            document.getElementById('prevHandle').innerText = `${handle} · Oct 1`;
+        }
+
+        function updatePreview() {
+            const caption = captionInput.value;
+            const title = titleInput.value;
+            const targetUrl = targetUrlInput.value || 'https://himhive.shop';
+            const videoUrl = videoUrlInput.value || 'https://www.w3schools.com/html/mov_bbb.mp4';
+
+            prevCaption.innerText = caption;
+            prevTitle.innerText = title;
+
+            let domain = 'himhive.shop';
+            try { domain = new URL(targetUrl).hostname.replace('www.', ''); } catch(e) {}
+            prevDomain.innerHTML = `<i class="fa-solid fa-link"></i> From ${domain}`;
+
+            if (videoUrl && prevVideo.src !== videoUrl) {
+                prevVideo.src = videoUrl;
+            }
+        }
+
+        videoCardRedirect.onclick = () => {
+            const targetUrl = targetUrlInput.value || 'https://himhive.shop';
+            window.open(targetUrl, '_blank');
+        };
+
+        videoFileInput.onchange = (e) => {
+            const file = e.target.files[0];
+            if (file) {
+                const objectUrl = URL.createObjectURL(file);
+                videoUrlInput.value = objectUrl;
+                prevVideo.src = objectUrl;
+                updatePreview();
+            }
+        };
+
+        publishDirectBtn.onclick = () => {
+            const text = captionInput.value;
+            const link = targetUrlInput.value;
+            const fullContent = `${text}\n\n${link}`;
+            const intentUrl = `https://x.com/intent/post?text=${encodeURIComponent(fullContent)}`;
+            window.open(intentUrl, '_blank');
+        };
+
+        [captionInput, titleInput, targetUrlInput, videoUrlInput].forEach(i => i.addEventListener('input', updatePreview));
+
+        autoDetectChromeProfileAccount();
+        updatePreview();
+    </script>
+</body>
+</html>

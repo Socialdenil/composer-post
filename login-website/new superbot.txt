@@ -1,0 +1,2660 @@
+// ==UserScript==
+// @name         SUPERBOT X
+// @namespace    http://tampermonkey.net/
+// @version      10.0
+// @description  SUPERBOT X — high-speed automated DM bot + tweet reposter for X.com. v10: full rebrand, new high-voltage theme.
+// @author       You
+// @match        https://x.com/messages
+// @match        https://x.com/messages/*
+// @match        https://x.com/i/chat
+// @match        https://x.com/i/chat/*
+// @match        https://x.com/*/status/*
+// @match        https://twitter.com/*/status/*
+// @grant        GM_webRequest
+// @grant        GM_addStyle
+// @grant        window.close
+// @run-at       document-start
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ============================================
+    // MEDIA BLOCKER — runs FIRST, before anything else.
+    // Blocks ALL images/videos/avatars/previews at network level so slow
+    // VPNs only load text + buttons (repost button is the priority).
+    // X renders DMs inside a Shadow DOM, which page-level CSS can't reach,
+    // so the blocker also injects CSS + a src-stripper into every shadow root.
+    // v8.5: fixed shadow-root discovery (v8.4 only checked template.shadowRoot,
+    // but declarative shadow roots usually live on the template's PARENT or
+    // another host — so the CSS never reached the chat). Now uses the same
+    // robust discovery as the bot, recurses into nested shadow roots,
+    // re-applies continuously, and also kills twimg background-images.
+    // ============================================
+    (function setupMediaBlocker() {
+        const MEDIA_CSS = 'img, picture, video, source, canvas, ' +
+            '[data-testid="tweetPhoto"], [data-testid="videoPlayer"] { display: none !important; }' +
+            'div[style*="twimg"], span[style*="twimg"], a[style*="twimg"] { background-image: none !important; }';
+
+        // Robust shadow-root discovery: declarative <template shadowrootmode>
+        // (the shadow root may sit on the template OR its parent element),
+        // imperative attachShadow hosts, and nested shadow roots.
+        function eachShadowRoot(cb) {
+            const seen = [];
+            function visit(scope) {
+                const found = [];
+                try {
+                    scope.querySelectorAll('template[shadowrootmode]').forEach(t => {
+                        if (t.shadowRoot) found.push(t.shadowRoot);
+                        if (t.parentElement && t.parentElement.shadowRoot) found.push(t.parentElement.shadowRoot);
+                    });
+                    scope.querySelectorAll('*').forEach(el => {
+                        if (el.shadowRoot) found.push(el.shadowRoot);
+                    });
+                } catch (e) {}
+                found.forEach(sr => {
+                    if (seen.indexOf(sr) < 0) {
+                        seen.push(sr);
+                        try { cb(sr); } catch (e) {}
+                        visit(sr); // nested shadow roots
+                    }
+                });
+            }
+            try { visit(document); } catch (e) {}
+        }
+
+        // 1) Network-level: cancel every X/Twitter media host.
+        try {
+            if (typeof GM_webRequest === 'function') {
+                GM_webRequest([
+                    { selector: { include: '*://*.twimg.com/*' }, action: 'cancel' }, // pbs/video/ton/abs — ALL X media
+                    { selector: { include: '*://*.pscp.tv/*' }, action: 'cancel' },   // live streams
+                ]);
+                console.log('[Bot] Media blocker active: all X media blocked (network).');
+            }
+        } catch (e) {
+            console.warn('[Bot] Media blocker (webRequest) failed:', e);
+        }
+
+        // 2) CSS hide, in the page and inside each shadow root.
+        function injectCss(root) {
+            try {
+                const target = (root === document) ? (document.head || document.documentElement) : root;
+                if (!target || target.querySelector('style[data-bot-media-block]')) return;
+                const st = document.createElement('style');
+                st.setAttribute('data-bot-media-block', '1');
+                st.textContent = MEDIA_CSS;
+                target.appendChild(st);
+            } catch (e) {}
+        }
+
+        // 3) Strip src/srcset so nothing even starts downloading (covers the
+        // case where the network cancel misses, e.g. cached or late hosts).
+        // Also clears twimg background-images (X sometimes renders avatars
+        // as divs with background-image instead of <img>).
+        function clearTwimgBg(el) {
+            try {
+                const bg = el.style && el.style.backgroundImage;
+                if (bg && bg.indexOf('twimg') >= 0) el.style.backgroundImage = 'none';
+            } catch (e) {}
+        }
+        function stripMedia(root) {
+            try {
+                root.querySelectorAll('img, picture, video, source').forEach(el => {
+                    el.removeAttribute('src');
+                    el.removeAttribute('srcset');
+                });
+                root.querySelectorAll('div[style*="twimg"], span[style*="twimg"], a[style*="twimg"]').forEach(clearTwimgBg);
+            } catch (e) {}
+        }
+
+        function watch(root) {
+            try {
+                const target = (root === document) ? document.documentElement : root;
+                if (!target || target.__botMediaWatch) return;
+                target.__botMediaWatch = true;
+                const obs = new MutationObserver(muts => {
+                    for (const m of muts) {
+                        m.addedNodes.forEach(n => {
+                            if (!n || n.nodeType !== 1) return;
+                            if (/^(IMG|VIDEO|PICTURE|SOURCE)$/.test(n.tagName)) {
+                                n.removeAttribute('src'); n.removeAttribute('srcset');
+                            }
+                            clearTwimgBg(n);
+                            try {
+                                n.querySelectorAll('img, video, picture, source').forEach(el => {
+                                    el.removeAttribute('src'); el.removeAttribute('srcset');
+                                });
+                                n.querySelectorAll('div[style*="twimg"], span[style*="twimg"], a[style*="twimg"]').forEach(clearTwimgBg);
+                            } catch (e) {}
+                        });
+                    }
+                });
+                obs.observe(target, { childList: true, subtree: true });
+            } catch (e) {}
+        }
+
+        const knownRoots = [];
+        function discover() {
+            eachShadowRoot(sr => { if (knownRoots.indexOf(sr) < 0) knownRoots.push(sr); });
+        }
+        function applyAll() {
+            try { if (typeof GM_addStyle === 'function') GM_addStyle(MEDIA_CSS); } catch (e) {}
+            injectCss(document);
+            stripMedia(document);
+            watch(document);
+            knownRoots.forEach(sr => { injectCss(sr); stripMedia(sr); watch(sr); });
+        }
+
+        discover();
+        applyAll();
+        console.log('[Bot] Media blocker: injected into ' + knownRoots.length + ' shadow root(s).');
+        // Keep re-applying: X can re-render/replace the shadow DOM later, and
+        // new shadow roots can appear as you navigate. Discovery re-runs when
+        // nothing is found yet or periodically; apply is idempotent and cheap.
+        // HARD STOP: when the user presses Stop, all background work freezes
+        // (window.__xBotHalted). Already-injected CSS stays — zero CPU — and
+        // the blocker resumes on the next Start.
+        if (typeof window.__xBotHalted === 'undefined') window.__xBotHalted = false;
+        let tick = 0;
+        setInterval(() => {
+            if (window.__xBotHalted) return;
+            tick++;
+            if (knownRoots.length === 0 || tick % 15 === 0) discover();
+            applyAll();
+        }, 2000);
+    })();
+
+    const isStatusPage = /\/(status|i\/status)\/\d+/.test(window.location.pathname);
+    const isChatPage = /\/(messages|i\/chat)/.test(window.location.pathname);
+
+    if (isStatusPage) {
+        runRepostScript();
+    } else if (isChatPage) {
+        runChatBotScript();
+    }
+
+    // ============================================
+    // REPOST SCRIPT (Fast execution on tweet pages)
+    // Media is blocked by the media blocker above, so the
+    // article + repost button load first on slow connections.
+    // ============================================
+    function runRepostScript() {
+        console.log("[Repost] Fast Script loaded. Starting...");
+
+        const MAX_WAIT_TIME = 60000;
+        const REFRESH_AFTER = 20000;
+        const MAX_REFRESH_ATTEMPTS = 3;
+        const RATE_LIMIT_PAUSE = 120000;
+        const REPOST_BUTTON_TIMEOUT = 45000;
+
+        let startTime = Date.now();
+        let contentLoadedTime = null;
+        let refreshCount = parseInt(sessionStorage.getItem('repost_refresh_count') || '0');
+        let repostAttempts = 0;
+        const MAX_REPOST_ATTEMPTS = 5;
+        let repostCompleted = false;
+        let rateLimitDetected = false;
+
+        const REPOST_IN_PROGRESS_KEY = 'ichat_repost_in_progress';
+
+        function setRepostStatus(status) {
+            localStorage.setItem(REPOST_IN_PROGRESS_KEY, JSON.stringify({
+                status: status,
+                url: window.location.href,
+                timestamp: Date.now()
+            }));
+            console.log(`[Repost] Status set to: ${status}`);
+        }
+
+        setRepostStatus('pending');
+
+        // PERMANENT skip — ONLY these two cases (user's explicit rule):
+        //  1. the post is gone: "Hmm...this page doesn't exist. Try
+        //     searching for something else."
+        //  2. the post broke X's rules: "This Post violated the X Rules."
+        // Everything else (blocked, protected, suspended, muted, slow
+        // loads, "something went wrong") is TRANSIENT — the tab keeps
+        // retrying through the normal timeout/refresh path and never
+        // permanently gives up on a maybe-good post.
+        function isPostPermanentlyGone() {
+            const elapsed = Date.now() - startTime;
+            if (elapsed < 3000) return false; // page still loading — don't judge yet
+            if (!document.body) return false;
+            const text = document.body.innerText.toLowerCase().replace(/[\u2019\u2018]/g, "'");
+            return text.includes("page doesn't exist") ||
+                   text.includes('violated the x rules');
+        }
+
+        setTimeout(checkAndAct, 300);
+
+        // Always operate on the article matching THIS page's status ID — a
+        // status page can render parent/reply articles around the target post.
+        function findMainTweet() {
+            const articles = document.querySelectorAll('article[data-testid="tweet"]');
+            if (!articles.length) return null;
+            const m = window.location.pathname.match(/\/status\/(\d+)/);
+            const statusId = m && m[1];
+            if (statusId) {
+                for (const a of articles) {
+                    try {
+                        if (a.querySelector(`a[href*="/status/${statusId}"]`)) return a;
+                    } catch (e) { }
+                }
+            }
+            return articles[0];
+        }
+
+        // The post shell can render before its action buttons on slow
+        // connections — poll for the buttons instead of failing instantly.
+        function waitForActionButtons(article, waitedMs) {
+            const tw = findMainTweet() || article;
+            if (!tw) { setTimeout(checkAndAct, 1000); return; }
+            if (tw.querySelector('[data-testid="unretweet"]')) { performUndo(); return; }
+            if (tw.querySelector('[data-testid="retweet"]')) { performRepost(); return; }
+            if (isPostPermanentlyGone()) {
+                setRepostStatus('failed_permanent');
+                updateSkippedStats();
+                sessionStorage.removeItem('repost_refresh_count');
+                setTimeout(() => window.close(), 800);
+                return;
+            }
+            if (waitedMs >= 30000 || (Date.now() - startTime) >= MAX_WAIT_TIME) {
+                console.log('[Repost] ⏱️ Buttons never rendered — giving up.');
+                setRepostStatus('failed');
+                updateSkippedStats();
+                sessionStorage.removeItem('repost_refresh_count');
+                setTimeout(() => window.close(), 800);
+                return;
+            }
+            setTimeout(() => waitForActionButtons(tw, waitedMs + 500), 500);
+        }
+
+        function checkAndAct() {
+            // document-start: body may not exist yet on the very first ticks
+            if (!document.body) {
+                setTimeout(checkAndAct, 300);
+                return;
+            }
+
+            const elapsed = Date.now() - startTime;
+
+            if (isPostPermanentlyGone()) {
+                console.log("[Repost] ❌ Post gone (deleted) or violated X rules — permanent skip.");
+                setRepostStatus('failed_permanent');
+                updateSkippedStats();
+                sessionStorage.removeItem('repost_refresh_count');
+                setTimeout(() => window.close(), 200);
+                return;
+            }
+
+            const tweet = findMainTweet();
+            const pageHasContent = document.body.innerText.length > 200;
+
+            if (pageHasContent && !contentLoadedTime) {
+                contentLoadedTime = Date.now();
+            }
+
+            // Check for explicit rate limit or broken loading state in page text
+            const lowerBodyText = document.body.innerText.toLowerCase();
+            const isExplicitRateLimit = [
+                'rate limit exceeded', 'something went wrong', 'try reloading',
+                'too many requests', 'page failed to load'
+            ].some(msg => lowerBodyText.includes(msg));
+
+            // Fast rate-limit / black screen detection (after 6s if no tweet & no content)
+            if (!rateLimitDetected && (isExplicitRateLimit || (elapsed > 6000 && !pageHasContent && !tweet))) {
+                rateLimitDetected = true;
+                console.log("[Repost] ⚠️ Rate limit / Black screen detected! Notifying parent & closing tab...");
+                localStorage.setItem('x_rate_limit_timestamp', Date.now().toString());
+                setRepostStatus('rate_limited');
+                sessionStorage.removeItem('repost_refresh_count');
+                setTimeout(() => window.close(), 200);
+                return;
+            }
+
+            if (!tweet) {
+                if (elapsed >= MAX_WAIT_TIME) {
+                    setRepostStatus('failed');
+                    sessionStorage.removeItem('repost_refresh_count');
+                    window.close();
+                    return;
+                }
+
+                if (contentLoadedTime && (Date.now() - contentLoadedTime) >= REPOST_BUTTON_TIMEOUT) {
+                    setRepostStatus('failed');
+                    updateSkippedStats();
+                    sessionStorage.removeItem('repost_refresh_count');
+                    window.close();
+                    return;
+                }
+
+                if (elapsed >= REFRESH_AFTER && !pageHasContent && refreshCount < MAX_REFRESH_ATTEMPTS) {
+                    refreshCount++;
+                    sessionStorage.setItem('repost_refresh_count', refreshCount.toString());
+                    setTimeout(() => location.reload(), 2000);
+                    return;
+                }
+
+                setTimeout(checkAndAct, 1000);
+                return;
+            }
+
+            sessionStorage.removeItem('repost_refresh_count');
+
+            const greenBtn = tweet.querySelector('[data-testid="unretweet"]');
+            const greyBtn = tweet.querySelector('[data-testid="retweet"]');
+
+            if (greenBtn) {
+                performUndo();
+            } else if (greyBtn) {
+                performRepost();
+            } else {
+                // Post shell loaded but buttons not yet rendered (slow VPN) —
+                // wait for them instead of skipping the repost.
+                waitForActionButtons(tweet, 0);
+            }
+        }
+
+        function updateSkippedStats() {
+            try {
+                const stats = JSON.parse(localStorage.getItem('ichat_bot_stats') || '{}');
+                stats.skipped = (stats.skipped || 0) + 1;
+                localStorage.setItem('ichat_bot_stats', JSON.stringify(stats));
+            } catch (e) { }
+        }
+
+        let undoAttempts = 0;
+        function performUndo() {
+            undoAttempts++;
+            if (undoAttempts > MAX_REPOST_ATTEMPTS) {
+                setRepostStatus('failed');
+                sessionStorage.removeItem('repost_refresh_count');
+                window.close();
+                return;
+            }
+
+            const currentTweet = findMainTweet();
+            const greenBtn = currentTweet?.querySelector('[data-testid="unretweet"]');
+
+            if (!greenBtn) {
+                const greyBtn = currentTweet?.querySelector('[data-testid="retweet"]');
+                if (greyBtn) {
+                    performRepost();
+                    return;
+                }
+            }
+
+            if (greenBtn) {
+                try { greenBtn.click(); } catch (e) { }
+            }
+
+            setTimeout(() => {
+                const confirm = document.querySelector('[data-testid="unretweetConfirm"]')
+                    || Array.from(document.querySelectorAll('[role="menuitem"], [data-testid="Dropdown"] div, [data-testid="Dropdown"] span'))
+                        .find(el => /undo\s*(repost|retweet)/i.test(el.innerText || ''));
+
+                if (confirm) {
+                    try { confirm.click(); } catch (e) { }
+                    waitForGrey();
+                } else {
+                    setTimeout(performUndo, 400);
+                }
+            }, 300);
+        }
+
+        function waitForGrey() {
+            let tries = 0;
+            const maxTries = 40;
+            const check = setInterval(() => {
+                tries++;
+                const tweet = findMainTweet();
+                const grey = tweet?.querySelector('[data-testid="retweet"]');
+                if (grey) {
+                    clearInterval(check);
+                    performRepost();
+                } else if (tries >= maxTries) {
+                    clearInterval(check);
+                    const green = tweet?.querySelector('[data-testid="unretweet"]');
+                    if (green) {
+                        performUndo();
+                    } else {
+                        setRepostStatus('failed');
+                        window.close();
+                    }
+                }
+            }, 100);
+        }
+
+        function performRepost() {
+            if (repostCompleted) {
+                window.close();
+                return;
+            }
+            repostAttempts++;
+            if (repostAttempts > MAX_REPOST_ATTEMPTS) {
+                setRepostStatus('failed');
+                sessionStorage.removeItem('repost_refresh_count');
+                window.close();
+                return;
+            }
+
+            const currentTweet = findMainTweet();
+            const greyBtn = currentTweet?.querySelector('[data-testid="retweet"]');
+
+            if (!greyBtn) {
+                const greenBtn = currentTweet?.querySelector('[data-testid="unretweet"]');
+                if (greenBtn) {
+                    repostCompleted = true;
+                    setRepostStatus('done');
+                    setTimeout(() => window.close(), 300);
+                    return;
+                }
+            }
+
+            if (greyBtn) {
+                try { greyBtn.click(); } catch (e) { }
+            }
+
+            setTimeout(() => {
+                const confirm = document.querySelector('[data-testid="retweetConfirm"]')
+                    || Array.from(document.querySelectorAll('[role="menuitem"], [data-testid="Dropdown"] div, [data-testid="Dropdown"] span'))
+                        .find(el => /^(repost|retweet)$/i.test((el.innerText || '').trim()));
+
+                if (confirm) {
+                    try { confirm.click(); } catch (e) { }
+                    let verifyAttempts = 0;
+                    const maxVerifyAttempts = 60;
+                    const verifyInterval = setInterval(() => {
+                        verifyAttempts++;
+                        const tweet = findMainTweet();
+                        const greenBtnNow = tweet?.querySelector('[data-testid="unretweet"]');
+                        if (greenBtnNow) {
+                            clearInterval(verifyInterval);
+                            repostCompleted = true;
+                            setRepostStatus('done');
+                            setTimeout(() => window.close(), 300);
+                        } else if (verifyAttempts >= maxVerifyAttempts) {
+                            clearInterval(verifyInterval);
+                            repostCompleted = true;
+                            setRepostStatus('done');
+                            setTimeout(() => window.close(), 200);
+                        }
+                    }, 100);
+                } else {
+                    setTimeout(performRepost, 400);
+                }
+            }, 300);
+        }
+    }
+
+    // ============================================
+    // CHAT BOT SCRIPT (DB-driven fast DM engine)
+    // v8.4 changes:
+    //  1) Persistent per-account USER DATABASE in localStorage. The inbox is
+    //     scanned fully only ONCE (to build the DB); daily runs re-scan the
+    //     inbox LIST (fast scroll, opens nothing) and open chats DIRECTLY via
+    //     each chat's real link (read from the chat row's anchor, saved in
+    //     the DB) instead of scrolling/clicking through the list.
+    //  2) Images/videos are blocked network-wide (see media blocker above).
+    //  3) "Incoming msgs only" jumps straight to unread (blue-dot) chats —
+    //     the unread dot is detected per chat row and saved in the DB.
+    //  4) Repost waits for the post + its repost button to actually load and
+    //     targets the exact tweet of the page URL (never skipped silently).
+    //  5) Tab-loop fixed: the tab reports permanent failures (deleted /
+    //     blocked / protected) separately so they are never retried; transient
+    //     failures get 3 attempts + a pending queue capped at 3 runs; a
+    //     30-tab per-run circuit breaker stops any tab spiral for good.
+    //  6) Jumps straight to unopened chats: the queue skips chats whose last
+    //     message is ours ("You: Done" rows) and chats already handled whose
+    //     last message hasn't gotten newer. Only chats with new incoming
+    //     messages are opened, top to bottom.
+    //  7) Smart scan: new messages always sit at the top of the inbox, so
+    //     the list scan STOPS as soon as it hits a calm stretch of
+    //     already-handled chats instead of scrolling to the very bottom.
+    //  8) A handled chat is NEVER re-opened unless there is positive evidence
+    //     of something new (blue dot, newer message age, changed preview).
+    //     The queue also logs WHY each chat was picked, for diagnosis.
+    //  9) DB v5: the old database (built before the handled-flags existed)
+    //     is rebuilt once, cleanly — stale flag-less records were the reason
+    //     already-handled chats kept being re-opened. The scan also prints a
+    //     summary (yours / unread / new) so you can verify it sees your inbox
+    //     correctly.
+    //  10) Startup gate: START only runs on x.com/messages (or an open
+    //     chat). Anywhere else it says so plainly instead of failing in a
+    //     3-second retry loop. The console also logs the running version on
+    //     load, so a stale install is obvious at a glance.
+    //  11) Inbox detection no longer trusts X's container testid alone: it
+    //     falls back to deriving the scroll container from the rendered
+    //     chat rows, so an X markup rename can't silently break the bot. If
+    //     detection still fails 3x, the error tells you the exact console
+    //     command to run so the real selector can be patched in.
+    //  12) Chat rows no longer depend on testids at all: findChatRows()
+    //     falls back to anchors pointing at /i/chat/<id> (URL structure is
+    //     stable even when X overhauls DM markup). getChatId/getChatUrl
+    //     read the id straight from the href, and the scroller, scan,
+    //     ordering and early-stop all use the new row finder.
+    //  13) ROOT CAUSE of the "Chat panel not found" loop: X moved the whole
+    //     DM UI inside a declarative Shadow DOM (<template shadowrootmode>),
+    //     which document.querySelector cannot see into. All inbox/conversation
+    //     lookups now go through deepQuery/deepQueryAll (light DOM + every
+    //     open shadow root). The scroller is found directly via its exact
+    //     testid (dm-conversation-scroller); unread detection reads X's own
+    //     aria-description ("..., Unread"); @handles come from aria-description
+    //     too; /i/chat/requests is excluded from row detection; row ids are
+    //     read from the href (dash form) since the testid uses a colon form.
+    //  14) Total media blocking: GM_webRequest cancels *://*.twimg.com/*
+    //     (covers pbs/video/ton/abs — avatars, tweet images, card previews,
+    //     DM attachments) plus *.pscp.tv; CSS display:none for
+    //     img/picture/video/source/canvas is injected into the page AND into
+    //     X's shadow-DOM chat (page CSS can't reach shadow roots); a
+    //     MutationObserver strips src/srcset from any media added later.
+    //  15) Unread-dot ground truth: hasUnreadDot() now checks X's actual dot
+    //     markup first — svg[data-icon="icon-circle-fill"] / .text-chat-accent
+    //     inside the row — with the old heuristics as fallback. "Incoming msgs
+    //     only" therefore targets exactly the chats carrying that div.
+    //     Never-twice rule: sending our message stamps interactedAt (+preview
+    //     /age); needsWork() then refuses to re-open the chat unless THEY
+    //     wrote something new after (fresh blue dot, newer age, or changed
+    //     preview). "📇 Build User DB" rescans and rebuilds it if you ever want a re-run.
+    //  16) Incoming-only is now a LIVE top-to-bottom sweep: starts at the top
+    //     of the inbox and moves down row by row, checking the live blue dot
+    //     on each row. The first unopened, never-interacted chat is cleared
+    //     fully (open -> repost -> message), then the sweep restarts at the
+    //     top since the inbox reorders. Ends when a full pass finds nothing.
+    //     No more "open everything" fallback when no dots are detected.
+    // ============================================
+    function runChatBotScript() {
+        const CONFIG = {
+            CHAT_DELAY: 500,
+            COOLDOWN_HOURS: 3,
+            SKIP_GROUPS: true,
+            AUTO_REPOST: true,
+            SEND_MESSAGE: true,
+            CUSTOM_MESSAGE: '',
+            MAX_CHATS: 0,
+            UNSEEN_ONLY: false, // true = only process chats where THEY messaged last
+        };
+
+        const STORAGE_KEY = 'x_chat_bot_done';
+        const SETTINGS_KEY = 'x_chat_bot_settings';
+        const STATE_KEY = 'x_chat_bot_state';
+        const RECOVERY_KEY = 'x_chat_bot_recovery';
+        const STATS_KEY = 'x_chat_bot_stats';
+        const BLANK_CHAT_THRESHOLD = 3;
+        const MAX_REFRESH_ATTEMPTS = 2;
+        const BASE_CHAT_URL = 'https://x.com/i/chat';
+        const BASE_CHAT_PATH = '/i/chat';
+        const RECOVERY_COOLDOWN = 20000;
+        const PAGE_LOAD_WAIT = 15000;
+
+        // ---- User database (per X account, so multiple accounts stay separate) ----
+        const USER_DB_VERSION = 5; // v5: adds mine/preview/handled flags — old DBs are rebuilt once so every record carries them
+        const USER_DB_MAX_USERS = 3000;
+        const USER_DB_PRUNE_DAYS = 60;
+
+        function getAccountId() {
+            try {
+                const m = document.cookie.match(/(?:^|;\s*)twid=u%3D(\d+)/)
+                    || document.cookie.match(/twid=[^;]*u%3D(\d+)/);
+                if (m && m[1]) return m[1];
+            } catch (e) { }
+            return 'default';
+        }
+
+        // The account's own @username, read from the nav profile link
+        // (href="/SomeUser"). Used to tie each account's DB to its username.
+        function getOwnHandle() {
+            try {
+                const links = deepQueryAll('nav a[href^="/"]');
+                for (const a of links) {
+                    const href = (a.getAttribute && a.getAttribute('href')) || '';
+                    if (!/^\/[A-Za-z0-9_]{1,15}$/.test(href)) continue;
+                    const low = href.toLowerCase();
+                    if (low === '/home' || low === '/explore' || low === '/notifications' ||
+                        low === '/messages' || low === '/search' || low === '/settings' ||
+                        low === '/compose' || low.startsWith('/i/')) continue;
+                    return href.slice(1);
+                }
+            } catch (e) { }
+            return '';
+        }
+
+        // DB key = version + account id + account @username, so every account
+        // keeps its own database, assigned to its username. Resolved lazily
+        // (once the page has rendered) and then frozen for the session.
+        let _userDbKey = null;
+        function userDbKey() {
+            if (_userDbKey) return _userDbKey;
+            const base = 'x_chat_bot_user_db_v' + USER_DB_VERSION + '_' + getAccountId();
+            const handle = getOwnHandle();
+            _userDbKey = handle ? base + '_' + handle.toLowerCase() : base;
+            return _userDbKey;
+        }
+        // Pre-v8.8 key (twid only) — used once to migrate the existing DB.
+        function legacyUserDbKey() {
+            return 'x_chat_bot_user_db_v' + USER_DB_VERSION + '_' + getAccountId();
+        }
+
+        // DB shape: { v: 5, accountName, users: { "<chatId>": { ... } } }
+        // The DB is loaded ONCE per account and kept in memory — no repeated
+        // localStorage reads, no repeated full inbox scans.
+        let cachedDb = null, cachedDbKey = null;
+        function loadUserDB() {
+            const k = userDbKey();
+            if (cachedDb && cachedDbKey === k) return cachedDb;
+            let db = null;
+            try {
+                const raw = localStorage.getItem(k);
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && parsed.v === USER_DB_VERSION && parsed.users && typeof parsed.users === 'object') {
+                        db = parsed;
+                    }
+                }
+            } catch (e) { }
+            if (!db) {
+                // One-time migration from the v8.7 twid-only key.
+                try {
+                    const rawLegacy = localStorage.getItem(legacyUserDbKey());
+                    if (rawLegacy) {
+                        const parsed = JSON.parse(rawLegacy);
+                        if (parsed && parsed.v === USER_DB_VERSION && parsed.users && typeof parsed.users === 'object') {
+                            db = parsed;
+                            localStorage.setItem(k, rawLegacy);
+                            console.log('[Bot-Fast] Migrated user DB to username-keyed storage.');
+                        }
+                    }
+                } catch (e) { }
+            }
+            if (!db) db = { v: USER_DB_VERSION, users: {}, accountName: getOwnHandle() || '' };
+            cachedDb = db;
+            cachedDbKey = k;
+            return db;
+        }
+
+        function invalidateDbCache() { cachedDb = null; cachedDbKey = null; _userDbKey = null; }
+
+        function saveUserDB(db) {
+            try {
+                // Prune users not seen for a long time + hard cap, so the DB stays lean.
+                const cutoff = Date.now() - USER_DB_PRUNE_DAYS * 24 * 3600 * 1000;
+                const ids = Object.keys(db.users);
+                for (const id of ids) {
+                    if ((db.users[id].lastSeen || 0) < cutoff) delete db.users[id];
+                }
+                const ids2 = Object.keys(db.users);
+                if (ids2.length > USER_DB_MAX_USERS) {
+                    ids2.sort((a, b) => (db.users[a].lastSeen || 0) - (db.users[b].lastSeen || 0));
+                    for (let i = 0; i < ids2.length - USER_DB_MAX_USERS; i++) delete db.users[ids2[i]];
+                }
+                if (!db.accountName) db.accountName = getOwnHandle() || '';
+                const k = userDbKey();
+                localStorage.setItem(k, JSON.stringify(db));
+                // Write-through cache: the in-memory DB stays the source of truth.
+                cachedDb = db;
+                cachedDbKey = k;
+            } catch (e) { /* quota errors are non-fatal */ }
+        }
+
+        function dbSize(db) {
+            return Object.keys(db.users).length;
+        }
+
+        const SEL = {
+            CHAT_PANEL: '[data-testid="dm-inbox-panel"]',
+            CHAT_ITEM: '[data-testid^="dm-conversation-item-"]',
+            MESSAGE_LIST: '[data-testid="dm-message-list"]',
+            COMPOSER: '[data-testid="dm-composer-textarea"]',
+            SEND_BTN: '[data-testid="dm-composer-send-button"]',
+            BACK_BTN: '[data-testid="dm-conversation-back-button"]',
+            TWEET_LINK: 'a[href*="/status/"]',
+        };
+
+        let isRunning = false;
+        let shouldStop = false;
+        let noRetry = false;      // set when the run must NOT auto-restart (wrong page / repeated panel failure)
+        let panelFailCount = 0;   // consecutive "chat panel not found" failures
+        let processedCount = 0;
+        let errorCount = 0;
+        let blankChatCount = 0;
+        // Chats that failed to open this session (transient) -> skip for 15 min, don't hot-loop.
+        const sessionFailed = new Map();
+
+        let stats = { processed: 0, skipped: 0, reposted: 0, messaged: 0 };
+
+        function loadPersistentStats() {
+            try {
+                const saved = JSON.parse(localStorage.getItem(STATS_KEY) || '{}');
+                return {
+                    processed: saved.processed || 0,
+                    skipped: saved.skipped || 0,
+                    reposted: saved.reposted || 0,
+                    messaged: saved.messaged || 0
+                };
+            } catch { return { processed: 0, skipped: 0, reposted: 0, messaged: 0 }; }
+        }
+
+        function savePersistentStats() {
+            localStorage.setItem(STATS_KEY, JSON.stringify(stats));
+        }
+
+        function saveSettings() {
+            const settings = {
+                customMessage: document.getElementById('customMsg')?.value || '',
+                maxChats: parseInt(document.getElementById('maxChats')?.value) || 0,
+                autoRepost: document.getElementById('toggleRepost')?.classList.contains('active') ?? true,
+                sendMessage: document.getElementById('toggleMsg')?.classList.contains('active') ?? true,
+                skipGroups: document.getElementById('toggleGroups')?.classList.contains('active') ?? true,
+                unseenOnly: document.getElementById('toggleUnseen')?.classList.contains('active') ?? false,
+                cooldownHours: parseInt(document.getElementById('cooldown')?.value) || 3,
+            };
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+        }
+
+        function loadSettings() {
+            try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'); } catch { return {}; }
+        }
+
+        function applySettings(settings) {
+            if (!settings || Object.keys(settings).length === 0) return;
+            if (settings.customMessage !== undefined) {
+                const el = document.getElementById('customMsg');
+                if (el) {
+                    el.value = settings.customMessage;
+                    document.getElementById('msgCounter').textContent = `${el.value.length}/280`;
+                }
+            }
+            if (settings.maxChats !== undefined) {
+                const el = document.getElementById('maxChats');
+                if (el) el.value = settings.maxChats;
+            }
+            if (settings.cooldownHours !== undefined) {
+                const el = document.getElementById('cooldown');
+                if (el) el.value = settings.cooldownHours;
+            }
+            if (settings.autoRepost !== undefined) {
+                const el = document.getElementById('toggleRepost');
+                if (el) el.classList.toggle('active', settings.autoRepost);
+            }
+            if (settings.sendMessage !== undefined) {
+                const el = document.getElementById('toggleMsg');
+                if (el) el.classList.toggle('active', settings.sendMessage);
+            }
+            if (settings.skipGroups !== undefined) {
+                const el = document.getElementById('toggleGroups');
+                if (el) el.classList.toggle('active', settings.skipGroups);
+            }
+            if (settings.unseenOnly !== undefined) {
+                const el = document.getElementById('toggleUnseen');
+                if (el) el.classList.toggle('active', settings.unseenOnly);
+            }
+        }
+
+        function saveState() {
+            const state = {
+                isRunning: isRunning,
+                processedCount: processedCount,
+                stats: stats,
+                timestamp: Date.now()
+            };
+            sessionStorage.setItem(STATE_KEY, JSON.stringify(state));
+        }
+
+        function loadState() {
+            try {
+                const saved = JSON.parse(sessionStorage.getItem(STATE_KEY) || '{}');
+                if (saved.timestamp && Date.now() - saved.timestamp < 300000) return saved;
+                return {};
+            } catch { return {}; }
+        }
+
+        function clearState() { sessionStorage.removeItem(STATE_KEY); }
+
+        function clearAllMemory() {
+            localStorage.removeItem(SETTINGS_KEY);
+            localStorage.removeItem(STORAGE_KEY);
+            localStorage.removeItem(STATS_KEY);
+            try { localStorage.removeItem(userDbKey()); } catch (e) { }
+            try { localStorage.removeItem(legacyUserDbKey()); } catch (e) { }
+            localStorage.removeItem('x_rate_limit_timestamp');
+            sessionStorage.removeItem(STATE_KEY);
+            sessionStorage.removeItem(RECOVERY_KEY);
+            try { sessionStorage.removeItem('x_db_scanned_' + userDbKey()); } catch (e) { }
+            try { sessionStorage.removeItem('x_db_scanned_' + legacyUserDbKey()); } catch (e) { }
+            invalidateDbCache();
+            stats = { processed: 0, skipped: 0, reposted: 0, messaged: 0 };
+            processedCount = 0;
+        }
+
+        function getRecoveryData() {
+            try { return JSON.parse(sessionStorage.getItem(RECOVERY_KEY) || '{}'); } catch { return {}; }
+        }
+
+        function getRefreshCount() {
+            const data = getRecoveryData();
+            return (data.timestamp && Date.now() - data.timestamp < 300000) ? (data.count || 0) : 0;
+        }
+
+        function getLastRecoveryTime() { return getRecoveryData().lastRecovery || 0; }
+
+        function incrementRefreshCount() {
+            const data = getRecoveryData();
+            const count = (data.count || 0) + 1;
+            sessionStorage.setItem(RECOVERY_KEY, JSON.stringify({
+                count: count, timestamp: Date.now(), lastRecovery: Date.now()
+            }));
+            return count;
+        }
+
+        function clearRefreshCount() { sessionStorage.removeItem(RECOVERY_KEY); }
+
+        function isPageStuck() {
+            const bodyText = document.body?.innerText?.trim() || '';
+            const isStuck = bodyText.length < 100 && !findInboxScroller() && !deepQuery('main');
+            return isStuck;
+        }
+
+        function canTriggerRecovery() {
+            const lastRecovery = getLastRecoveryTime();
+            return (lastRecovery === 0 || (Date.now() - lastRecovery) >= RECOVERY_COOLDOWN);
+        }
+
+        function triggerRecovery(reason) {
+            if (!canTriggerRecovery()) return;
+            if (findInboxScroller()) {
+                clearRefreshCount();
+                return;
+            }
+            log(`⚠️ ${reason} - refreshing...`);
+            saveSettings();
+            saveState();
+            const refreshCount = incrementRefreshCount();
+            if (refreshCount <= MAX_REFRESH_ATTEMPTS) {
+                setTimeout(() => location.reload(), 3000);
+            } else {
+                clearRefreshCount();
+                setTimeout(() => { window.location.href = BASE_CHAT_URL; }, 3000);
+            }
+        }
+
+        function getProcessed() {
+            try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}'); } catch { return {}; }
+        }
+        function markProcessed(id) {
+            const data = getProcessed();
+            data[id] = Date.now();
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+        }
+        function isInCooldown(id) {
+            const data = getProcessed();
+            if (!data[id]) return false;
+            return Date.now() - data[id] < CONFIG.COOLDOWN_HOURS * 3600000;
+        }
+
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+        function waitForBody(timeout = 15000) {
+            return new Promise(res => {
+                if (document.body) return res(true);
+                const obs = new MutationObserver(() => {
+                    if (document.body) { obs.disconnect(); res(true); }
+                });
+                try { obs.observe(document.documentElement, { childList: true }); } catch (e) { return res(false); }
+                setTimeout(() => { obs.disconnect(); res(!!document.body); }, timeout);
+            });
+        }
+
+        function log(msg) {
+            console.log(`[Bot-Fast] ${msg}`);
+            const el = document.getElementById('botStatus');
+            if (el) el.textContent = msg;
+        }
+
+        function escapeHtml(s) {
+            return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+
+        function simulateClick(el) {
+            if (!el) return;
+            try {
+                const rect = el.getBoundingClientRect();
+                const opts = {
+                    bubbles: true, cancelable: true,
+                    clientX: rect.left + rect.width / 2,
+                    clientY: rect.top + rect.height / 2
+                };
+                el.dispatchEvent(new MouseEvent('mousedown', opts));
+                el.dispatchEvent(new MouseEvent('mouseup', opts));
+                el.dispatchEvent(new MouseEvent('click', opts));
+            } catch (e) {
+                el.click();
+            }
+        }
+
+        // X now renders DMs inside a declarative Shadow DOM
+        // (<template shadowrootmode="open">). document.querySelector can't see
+        // in there — these helpers search the light DOM plus every open
+        // shadow root. (v8.3 root-cause fix.)
+        function shadowRoots() {
+            const roots = [];
+            try {
+                document.querySelectorAll('template[shadowrootmode]').forEach(t => {
+                    if (t.shadowRoot && roots.indexOf(t.shadowRoot) < 0) roots.push(t.shadowRoot);
+                });
+                if (!roots.length) {
+                    document.querySelectorAll('*').forEach(el => {
+                        if (el.shadowRoot && roots.indexOf(el.shadowRoot) < 0) roots.push(el.shadowRoot);
+                    });
+                }
+            } catch (e) {}
+            return roots;
+        }
+        function deepQueryAll(sel) {
+            const out = [];
+            try { document.querySelectorAll(sel).forEach(e => out.push(e)); } catch (e) {}
+            shadowRoots().forEach(r => {
+                try { r.querySelectorAll(sel).forEach(e => out.push(e)); } catch (e) {}
+            });
+            return out;
+        }
+        function deepQuery(sel) {
+            try { const el = document.querySelector(sel); if (el) return el; } catch (e) {}
+            const roots = shadowRoots();
+            for (const r of roots) {
+                try { const el = r.querySelector(sel); if (el) return el; } catch (e) {}
+            }
+            return null;
+        }
+
+        async function waitFor(sel, timeout = 2000) {
+            const start = Date.now();
+            while (Date.now() - start < timeout) {
+                const el = deepQuery(sel);
+                if (el) return el;
+                await sleep(50);
+            }
+            return null;
+        }
+
+        // Chat rows, surviving X testid renames. Strategy 1: known row
+        // testids. Strategy 2: anchors pointing at /i/chat/<id> — X can
+        // rename markup freely, but the URL structure is stable.
+        function findChatRows() {
+            const byTestid = deepQueryAll(SEL.CHAT_ITEM);
+            if (byTestid.length) return byTestid;
+            const seen = new Set();
+            const rows = [];
+            deepQueryAll('a[href*="/i/chat/"]').forEach(a => {
+                const m = (a.getAttribute('href') || '').match(/\/i\/chat\/([^/?#]+)/);
+                if (!m || seen.has(m[1])) return;
+                if (/^(requests|new)$/i.test(m[1])) return; // not a conversation
+                seen.add(m[1]);
+                rows.push(a);
+            });
+            return rows;
+        }
+
+        // Inbox detection. Strategy 1: the conversation scroller itself
+        // (exact testid from X's live DOM). Strategy 2: the known panel
+        // testid. Strategy 3: derive the scroll container from a rendered
+        // chat row — walk up to the scrollable ancestor.
+        function findInboxScroller() {
+            const scroller = deepQuery('[data-testid="dm-conversation-scroller"]');
+            if (scroller) return scroller;
+            const panel = deepQuery(SEL.CHAT_PANEL);
+            if (panel) return panel.querySelector('.scrollbar-thin-custom') || panel;
+            const item = findChatRows()[0];
+            if (item) {
+                let el = item.parentElement;
+                while (el && el !== document.body) {
+                    let oy = '';
+                    try { oy = getComputedStyle(el).overflowY; } catch (e) { break; }
+                    if ((oy === 'auto' || oy === 'scroll') && el.scrollHeight > el.clientHeight + 40) return el;
+                    el = el.parentElement;
+                }
+            }
+            return null;
+        }
+
+        async function waitForInbox(timeout = 15000) {
+            const t0 = Date.now();
+            while (Date.now() - t0 < timeout) {
+                const sc = findInboxScroller();
+                if (sc) return sc;
+                await sleep(250);
+            }
+            return null;
+        }
+
+        function getChatId(el) {
+            const td = el.getAttribute('data-testid') || '';
+            if (td.indexOf('dm-conversation-item-') === 0) return td.replace('dm-conversation-item-', '');
+            // Testid-free fallback: the chat id is the last /i/chat/<id> path segment.
+            const a = (el.tagName === 'A') ? el : el.querySelector('a[href*="/i/chat/"]');
+            const m = ((a && a.getAttribute('href')) || '').match(/\/i\/chat\/([^/?#]+)/);
+            return m ? m[1] : '';
+        }
+
+        function isGroup(el) {
+            return /dm-conversation-item-g/.test(el.getAttribute('data-testid') || '');
+        }
+
+        function getChatAgeInMinutes(chatEl) {
+            try {
+                const timeEl = chatEl.querySelector('time');
+                if (timeEl) {
+                    const datetime = timeEl.getAttribute('datetime');
+                    if (datetime) {
+                        const msgTime = new Date(datetime).getTime();
+                        if (!isNaN(msgTime) && msgTime > 0) {
+                            return (Date.now() - msgTime) / (1000 * 60);
+                        }
+                    }
+                    const txt = timeEl.textContent.trim().toLowerCase();
+                    if (txt.endsWith('s') || txt === 'now') return 0;
+                    if (txt.endsWith('m')) return parseInt(txt) || 0;
+                    if (txt.endsWith('h')) return (parseInt(txt) || 0) * 60;
+                    if (txt.endsWith('d')) return (parseInt(txt) || 0) * 1440;
+                }
+                const text = chatEl.innerText || '';
+                const match = text.match(/·\s*(\d+)\s*([smhd])/i) || text.match(/\b(\d+)\s*([smhd])\b/i);
+                if (match) {
+                    const val = parseInt(match[1]);
+                    const unit = match[2].toLowerCase();
+                    if (unit === 's') return 0;
+                    if (unit === 'm') return val;
+                    if (unit === 'h') return val * 60;
+                    if (unit === 'd') return val * 1440;
+                }
+            } catch (e) { }
+            return 99999;
+        }
+
+        // Best-effort extraction of display name + @handle from a chat list item.
+        // The chat ID is the source of truth; name/handle are just labels for the DB.
+        function extractUserInfo(chatEl) {
+            let name = '', username = '', ageMin = null;
+            try {
+                // X puts "Name, @handle, preview, age, Unread" in the row's
+                // aria-description — the @handle isn't rendered visibly anymore.
+                const ad = (chatEl.getAttribute('aria-description') || '')
+                    + ' ' + ((chatEl.parentElement && chatEl.parentElement.getAttribute('aria-description')) || '');
+                const adm = ad.match(/@([A-Za-z0-9_]{1,15})/);
+                if (adm) username = '@' + adm[1];
+                const lines = (chatEl.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+                if (lines.length > 0) {
+                    const first = lines[0];
+                    const m = first.match(/^(.*?)\s*@([A-Za-z0-9_]{1,15})\s*(·.*)?$/);
+                    if (m) {
+                        name = (m[1] || '').trim();
+                        username = '@' + m[2];
+                    } else {
+                        name = first;
+                        if (!username) for (let i = 1; i < Math.min(lines.length, 3); i++) {
+                            const hm = lines[i].match(/@([A-Za-z0-9_]{1,15})/);
+                            if (hm) { username = '@' + hm[1]; break; }
+                        }
+                    }
+                }
+                const age = getChatAgeInMinutes(chatEl);
+                ageMin = (age === 99999) ? null : Math.round(age);
+            } catch (e) { }
+            return { name, username, ageMin };
+        }
+
+        // Read the chat's REAL link from its row anchor. The chat-id inside
+        // data-testid is NOT always URL-safe (e.g. different separator than
+        // the real URL), so never construct the URL from the id — use the
+        // link X itself renders for the row.
+        function getChatUrl(chatEl) {
+            try {
+                const href0 = chatEl.getAttribute('href') || '';
+                const link = (chatEl.tagName === 'A' && href0.includes('/i/chat/'))
+                    ? chatEl
+                    : (chatEl.querySelector('a[href*="/i/chat/"]') || chatEl.querySelector('a[role="option"]'));
+                const href = link ? link.getAttribute('href') : null;
+                if (href && href.includes('/i/chat/')) return href.split('?')[0];
+            } catch (e) { }
+            return '';
+        }
+
+        // Detect the unread (blue dot) indicator on a chat row, using several
+        // strategies since X changes markup often. Cheap checks first.
+        function hasUnreadDot(chatEl) {
+            try {
+                const id = getChatId(chatEl);
+                const ownSel = id ? 'a[href*="/i/chat/' + id + '"]' : null;
+                const scopeOwnsChat = (scope) => {
+                    if (!ownSel) return true;
+                    try {
+                        return (scope.matches && scope.matches(ownSel)) || !!scope.querySelector(ownSel);
+                    } catch (e) { return true; }
+                };
+                // 0) The unread dot itself, straight from X's markup (ground
+                // truth): a filled-circle svg with data-icon="icon-circle-fill"
+                // and the text-chat-accent class. It may live inside the row,
+                // or on the row container NEXT TO the anchor (sibling, not
+                // child) — so walk up, but stop before leaving this row: a
+                // scope holding several chats' links is the list, not the row,
+                // and a dot found there could be a sibling row's.
+                let scope = chatEl;
+                for (let i = 0; i < 3 && scope && scope.querySelector; i++) {
+                    let linkCount = 0;
+                    try {
+                        const seenIds = new Set();
+                        scope.querySelectorAll('a[href*="/i/chat/"]').forEach(a => {
+                            const m = (a.getAttribute('href') || '').match(/\/i\/chat\/([^/?#]+)/);
+                            if (m && !/^(requests|new)$/i.test(m[1])) seenIds.add(m[1]);
+                        });
+                        linkCount = seenIds.size;
+                    } catch (e) { }
+                    if (linkCount > 1) break;
+                    const svg = scope.querySelector('svg[data-icon="icon-circle-fill"], .text-chat-accent');
+                    // Level 0 (the element itself): accept like before. Higher
+                    // levels: only accept a dot from a scope owning this chat.
+                    if (svg && (scope === chatEl || scopeOwnsChat(scope))) return true;
+                    scope = scope.parentElement;
+                }
+                // 1) X's own accessibility label on the row ("..., Unread").
+                // Check the row and its containers (fixed: the old version's
+                // || / + precedence silently dropped the parent's label).
+                let ad = '';
+                let el = chatEl;
+                for (let i = 0; i < 3 && el; i++) {
+                    ad += ' ' + (el.getAttribute('aria-description') || '') + ' ' + (el.getAttribute('aria-label') || '');
+                    el = el.parentElement;
+                }
+                if (/\bunread\b/i.test(ad)) return true;
+                // 2) Known testids / class fragments mentioning unread.
+                if (chatEl.querySelector('[data-testid="unread"], [class*="unread" i]')) return true;
+                if (chatEl.querySelector('[data-testid*="unread" i]')) return true;
+                // 3) Accessibility label mentioning unread.
+                if (chatEl.querySelector('[aria-label*="unread" i]')) return true;
+                // 4) The dot itself: a tiny element filled with X blue (#1d9bf0).
+                const walker = document.createTreeWalker(chatEl, NodeFilter.SHOW_ELEMENT);
+                let node;
+                while ((node = walker.nextNode())) {
+                    const w = node.offsetWidth, h = node.offsetHeight;
+                    if (!w || !h || w > 10 || h > 10) continue;
+                    const cs = getComputedStyle(node);
+                    const bg = (cs.backgroundColor || '').replace(/\s/g, '');
+                    const fill = (cs.fill || '').replace(/\s/g, '');
+                    if (bg === 'rgb(29,155,240)' || bg === 'rgba(29,155,240,1)' ||
+                        fill === 'rgb(29,155,240)' || fill === '#1d9bf0') return true;
+                }
+            } catch (e) { }
+            return false;
+        }
+
+        // "You:"/"Your:" prefix in the row preview = our message is last in
+        // the chat = already handled. Anything else = unopened incoming message.
+        // (Checked on every line except the name line, so a display name
+        // starting with "You" can never false-positive.)
+        function rowLastIsMine(chatEl) {
+            try {
+                const t = chatEl.innerText || chatEl.textContent || '';
+                const lines = t.split('\n').map(s => s.trim()).filter(Boolean);
+                return lines.slice(1).some(l => /^your?\s*:/i.test(l));
+            } catch (e) { return false; }
+        }
+
+        // Best-effort capture of the row's message-preview line (used to tell
+        // whether anything new arrived since we last handled the chat).
+        function extractPreview(chatEl) {
+            try {
+                const t = chatEl.innerText || chatEl.textContent || '';
+                const lines = t.split('\n').map(s => s.trim()).filter(Boolean);
+                const skip = /^(now|yesterday|\d+[smhdwy]|@[\w]{1,15})$/i;
+                const found = lines.slice(1).find(l => !skip.test(l));
+                return (found || '').slice(0, 100);
+            } catch (e) { return ''; }
+        }
+
+        // orderHint: inbox position for newly discovered chats (0 = top).
+        // Existing entries keep their saved order.
+        function upsertUserFromEl(db, chatEl, orderHint) {
+            const id = getChatId(chatEl);
+            if (!id) return;
+            const info = extractUserInfo(chatEl);
+            const prev = db.users[id] || {};
+            db.users[id] = {
+                id: id,
+                name: info.name || prev.name || '',
+                username: info.username || prev.username || '',
+                isGroup: isGroup(chatEl),
+                url: getChatUrl(chatEl) || prev.url || '',
+                order: (orderHint !== undefined && !prev.id) ? orderHint : (prev.order ?? 1e9),
+                unread: hasUnreadDot(chatEl),
+                mine: rowLastIsMine(chatEl),
+                preview: extractPreview(chatEl),
+                handledAt: prev.handledAt || null,
+                handledAgeMin: (prev.handledAgeMin !== undefined && prev.handledAgeMin !== null) ? prev.handledAgeMin : null,
+                handledPreview: prev.handledPreview || null,
+                // Never interact twice: once we've sent our message in a
+                // chat, it stays done unless THEY write something new after.
+                interactedAt: prev.interactedAt || null,
+                interactedAgeMin: (prev.interactedAgeMin !== undefined && prev.interactedAgeMin !== null) ? prev.interactedAgeMin : null,
+                interactedPreview: prev.interactedPreview || null,
+                lastSeen: Date.now(),
+                lastMsgMin: (info.ageMin !== null && info.ageMin !== undefined) ? info.ageMin : (prev.lastMsgMin ?? null),
+            };
+        }
+
+        // Remember that a chat was fully handled and how old its last message
+        // was — the next run skips it unless a newer message arrived.
+        function markChatHandled(chatId) {
+            try {
+                const db = loadUserDB();
+                const u = db.users[chatId];
+                if (u) {
+                    u.handledAt = Date.now();
+                    u.handledAgeMin = (u.lastMsgMin !== null && u.lastMsgMin !== undefined) ? u.lastMsgMin : null;
+                    u.handledPreview = u.preview || null;
+                    u.unread = false;
+                    saveUserDB(db);
+                }
+            } catch (e) { }
+        }
+
+        // We SENT our message in this chat — never interact with it again
+        // unless there is positive evidence THEY wrote something new after
+        // our message (blue dot, newer age, changed preview).
+        function markChatInteracted(chatId) {
+            try {
+                const db = loadUserDB();
+                const u = db.users[chatId];
+                if (u) {
+                    u.interactedAt = Date.now();
+                    u.interactedAgeMin = (u.lastMsgMin !== null && u.lastMsgMin !== undefined) ? u.lastMsgMin : null;
+                    u.interactedPreview = u.preview || null;
+                    u.unread = false;
+                    saveUserDB(db);
+                }
+            } catch (e) { }
+        }
+
+        // Opening a chat marks it read in X — clear our unread flag so the
+        // next Incoming-only run doesn't revisit it.
+        function clearUnreadFlag(chatId) {
+            try {
+                const db = loadUserDB();
+                if (db.users[chatId] && db.users[chatId].unread) {
+                    db.users[chatId].unread = false;
+                    saveUserDB(db);
+                }
+            } catch (e) { }
+        }
+
+        // Upsert whatever chat items are currently rendered (top of inbox).
+        // New messages always land at the top, so this catches new chats
+        // without scrolling through the whole list.
+        function upsertVisibleChats(db, orderState) {
+            const items = findChatRows();
+            items.forEach(el => upsertUserFromEl(db, el, orderState ? orderState.next++ : undefined));
+            return items.length;
+        }
+
+        // Daily-run refresh: re-rank the currently visible (top) chats to the
+        // front of the queue in their on-screen order, keep everyone else's
+        // relative order after them. New chats discovered here land on top,
+        // exactly where they appear in the inbox.
+        function refreshTopOrder(db) {
+            const items = findChatRows();
+            const seenIds = new Set();
+            let order = 0;
+            for (const el of items) {
+                const id = getChatId(el);
+                if (!id || seenIds.has(id)) continue;
+                seenIds.add(id);
+                upsertUserFromEl(db, el);
+                db.users[id].order = order++;
+            }
+            const rest = Object.values(db.users)
+                .filter(u => !seenIds.has(u.id))
+                .sort((a, b) => (a.order ?? 1e9) - (b.order ?? 1e9));
+            for (const u of rest) u.order = order++;
+            saveUserDB(db);
+            return seenIds.size;
+        }
+
+        // A chat needs work when it has an unopened (blue-dot) message or its
+        // last message is not ours. NEVER interact with the same chat twice:
+        // once we've sent our message (interactedAt), the chat is done unless
+        // there is positive evidence THEY wrote something new after — a fresh
+        // blue dot, a newer message age, or changed preview text.
+        function needsWork(u) {
+            if (!u) return true;
+            if (u.interactedAt) {
+                if (u.unread) return true; // blue dot = unopened message from them
+                if (u.mine === true) return false; // our message is last — nothing new
+                const ageNewer = u.interactedAgeMin != null && u.lastMsgMin != null &&
+                    u.lastMsgMin < u.interactedAgeMin;
+                const previewChanged = !!(u.interactedPreview && u.preview &&
+                    u.interactedPreview !== u.preview);
+                return ageNewer || previewChanged;
+            }
+            if (u.unread) return true;
+            if (u.mine === true) return false;
+            if (!u.handledAt) return true;
+            const ageNewer = u.handledAgeMin != null && u.lastMsgMin != null &&
+                u.lastMsgMin < u.handledAgeMin;
+            const previewChanged = !!(u.handledPreview && u.preview &&
+                u.handledPreview !== u.preview);
+            return ageNewer || previewChanged;
+        }
+
+        // Full inbox-list scan (scroll only — never opens a chat). New
+        // messages always land at the top, so the scan STOPS as soon as it
+        // hits a calm stretch of already-handled chats — everything below is
+        // older and needs nothing. (First-ever build still scans everything.)
+        async function fullInboxScan(db) {
+            const scroller = await waitForInbox(10000);
+            if (!scroller) {
+                log('⚠️ Chat panel not found — cannot scan inbox.');
+                return;
+            }
+            let lastH = 0, still = 0, calmPages = 0;
+            const wasStopping = shouldStop;
+            shouldStop = false;
+            const isFirstBuild = dbSize(db) === 0;
+            // Continue numbering after existing entries (re-scan keeps old order).
+            let maxOrder = -1;
+            for (const u of Object.values(db.users)) {
+                if (typeof u.order === 'number' && u.order > maxOrder) maxOrder = u.order;
+            }
+            const orderState = { next: maxOrder + 1 };
+            try {
+                while (still < 4 && !shouldStop) {
+                    const n = upsertVisibleChats(db, orderState);
+                    // Early stop: if the bottom of the rendered list is all
+                    // already-handled chats, everything further down is older
+                    // — stop scrolling and go work on the new chats found.
+                    let tailCalm = false;
+                    if (!isFirstBuild) {
+                        const items = findChatRows();
+                        const tail = items.slice(-8);
+                        tailCalm = tail.length > 0 && tail.every(el => {
+                            const id = getChatId(el);
+                            const u = id ? db.users[id] : null;
+                            return u ? !needsWork(u) : false;
+                        });
+                    }
+                    if (tailCalm) calmPages++; else calmPages = 0;
+                    if (calmPages >= 2) {
+                        const fresh = Object.values(db.users).filter(needsWork).length;
+                        log(`📇 Found ${fresh} chat(s) with new messages — stopping scan, going to work.`);
+                        break;
+                    }
+                    log(`📇 Scanning inbox... ${dbSize(db)} users so far`);
+                    scroller.scrollTop = scroller.scrollHeight;
+                    await sleep(700);
+                    if (scroller.scrollHeight === lastH) still++;
+                    else { still = 0; lastH = scroller.scrollHeight; }
+                    if (n === 0 && still >= 2) break;
+                }
+            } finally {
+                shouldStop = wasStopping;
+                try { scroller.scrollTop = 0; } catch (e) { }
+                saveUserDB(db);
+                // Scan summary: proves the detectors see what you see.
+                try {
+                    const all = Object.values(db.users);
+                    const mineN = all.filter(u => u.mine === true).length;
+                    const unreadN = all.filter(u => u.unread).length;
+                    const newN = all.filter(u => needsWork(u)).length;
+                    log(`📇 Scan summary: ${all.length} chats — ${mineN} already yours, 🔵 ${unreadN} unread, ${newN} new to handle.`);
+                } catch (e) { }
+            }
+        }
+
+        // Who sent the last message? The row preview ("You:") is ground truth:
+        // a shared post ("Sent a post") renders as a WIDE centered embed whose
+        // center is not left-of-center, so pure geometry misreads it as ours
+        // and the chat gets skipped (its post never reposted). Trust the row
+        // flag first; fall back to geometry only when the row gave no preview.
+        function isLastMessageReceived(user) {
+            try {
+                if (user && user.mine) return false;
+                if (user && user.preview) return true;
+            } catch (e) { }
+            const list = deepQuery(SEL.MESSAGE_LIST);
+            if (!list) return false;
+            const messages = list.querySelectorAll('[data-testid^="message-"]');
+            if (messages.length === 0) return false;
+
+            const lastMessage = messages[messages.length - 1];
+            if (!lastMessage) return false;
+
+            const listRect = list.getBoundingClientRect();
+            const listCenter = listRect.left + (listRect.width / 2);
+            const msgRect = lastMessage.getBoundingClientRect();
+            const msgCenter = msgRect.left + (msgRect.width / 2);
+
+            return msgCenter < listCenter;
+        }
+
+        function extractTweets(lastIsReceived) {
+            const list = deepQuery(SEL.MESSAGE_LIST);
+            if (!list) return [];
+
+            const messages = list.querySelectorAll('[data-testid^="message-"]');
+            const lastMessage = messages.length ? messages[messages.length - 1] : null;
+
+            const linksWithPosition = [];
+            const addedUrls = new Set();
+
+            function isSentMessage(el) {
+                // A shared post is a WIDE centered embed — geometry can't tell
+                // its sender. But if the last message is known-received (row
+                // preview) and this link lives inside it, it's theirs.
+                if (lastIsReceived && lastMessage && lastMessage.contains(el)) return false;
+                const rect = el.getBoundingClientRect();
+                const listRect = list.getBoundingClientRect();
+                return (rect.left + rect.width / 2) > (listRect.left + listRect.width / 2);
+            }
+
+            function addLink(el, href) {
+                if (!href || !href.includes('/status/')) return;
+                if (!href.includes('x.com') && !href.includes('twitter.com')) return;
+                const cleanUrl = href.split('?')[0];
+                if (addedUrls.has(cleanUrl)) return;
+                if (isSentMessage(el)) return;
+                addedUrls.add(cleanUrl);
+                const rect = el.getBoundingClientRect();
+                linksWithPosition.push({ url: cleanUrl, top: rect.top || 0 });
+            }
+
+            list.querySelectorAll('a[href*="/status/"]').forEach(el => addLink(el, el.href));
+            list.querySelectorAll('[data-testid^="message-text-"] a').forEach(el => {
+                if (el.href?.includes('/status/')) addLink(el, el.href);
+            });
+
+            linksWithPosition.sort((a, b) => b.top - a.top);
+
+            // Skip tweets already reposted or known-dead (tracked across runs) —
+            // never repost twice, and never chase an un-repostable tweet forever.
+            const fresh = linksWithPosition.filter(l => !isTweetReposted(l.url) && !isTweetDead(l.url));
+            if (fresh.length > 0) {
+                return [fresh[0].url];
+            }
+            return [];
+        }
+
+        const REPOST_IN_PROGRESS_KEY = 'ichat_repost_in_progress';
+        const RATE_LIMIT_KEY = 'x_rate_limit_timestamp';
+        const RATE_LIMIT_COOLDOWN_MS = 6 * 60 * 1000; // 6 Minutes Cooldown
+
+        function isRateLimited() {
+            const lastLimit = parseInt(localStorage.getItem(RATE_LIMIT_KEY) || '0');
+            if (!lastLimit) return false;
+            const elapsed = Date.now() - lastLimit;
+            return elapsed < RATE_LIMIT_COOLDOWN_MS;
+        }
+
+        async function handle6MinuteRateLimit() {
+            let lastLimit = parseInt(localStorage.getItem(RATE_LIMIT_KEY) || '0');
+            if (!lastLimit) {
+                lastLimit = Date.now();
+                localStorage.setItem(RATE_LIMIT_KEY, lastLimit.toString());
+            }
+
+            log('⚠️ Post Limit / Black Screen reached! 6-Minute Cooldown started...');
+
+            while (true) {
+                if (shouldStop) break;
+                const elapsed = Date.now() - lastLimit;
+                const remainingMs = RATE_LIMIT_COOLDOWN_MS - elapsed;
+
+                if (remainingMs <= 0) {
+                    localStorage.removeItem(RATE_LIMIT_KEY);
+                    log('✅ 6-Minute Cooldown complete! Resuming...');
+                    await sleep(500);
+                    break;
+                }
+
+                const totalSec = Math.ceil(remainingMs / 1000);
+                const mins = Math.floor(totalSec / 60);
+                const secs = totalSec % 60;
+                const padSecs = secs < 10 ? '0' + secs : secs;
+                const padMins = mins < 10 ? '0' + mins : mins;
+
+                log(`⏳ Rate Limit Pause: ${padMins}:${padSecs} remaining...`);
+                await sleep(1000);
+            }
+        }
+
+        function getRepostStatus() {
+            try {
+                const data = JSON.parse(localStorage.getItem(REPOST_IN_PROGRESS_KEY) || '{}');
+                return data.status || null;
+            } catch { return null; }
+        }
+
+        function clearRepostStatus() { localStorage.removeItem(REPOST_IN_PROGRESS_KEY); }
+
+        // Circuit breaker: hard cap on tweet tabs per run — no failure mode
+        // may ever spiral into opening tabs endlessly.
+        const MAX_TWEET_TABS_PER_RUN = 30;
+        let tweetTabsOpened = 0;
+        let lastRepostTab = null;
+
+        // Returns a status string: 'done' | 'failed' (transient) |
+        // 'failed_permanent' (deleted/blocked/protected — never retry) |
+        // 'timeout' | 'rate_limited' | 'popup_blocked' | 'capped'
+        async function openTweet(url) {
+            if (tweetTabsOpened >= MAX_TWEET_TABS_PER_RUN) {
+                log('🛑 Tweet-tab cap reached for this run — skipping further reposts.');
+                return 'capped';
+            }
+            if (isRateLimited()) {
+                await handle6MinuteRateLimit();
+                if (shouldStop) return 'rate_limited';
+            }
+
+            log('⚡ Fast opening tweet tab...');
+            try {
+                clearRepostStatus();
+                // Close any lingering tab from a previous attempt first so two
+                // tabs never fight over the single repost-status key.
+                try { if (lastRepostTab && !lastRepostTab.closed) lastRepostTab.close(); } catch (e) { }
+                lastRepostTab = null;
+                const tab = window.open(url, '_blank', 'noopener,noreferrer');
+                if (!tab) {
+                    log('⚠️ Popup blocked! Allow popups for x.com or reposts cannot run.');
+                    return 'popup_blocked';
+                }
+                lastRepostTab = tab;
+                tweetTabsOpened++;
+                window.focus();
+                // Give the tab enough time on slow connections: the repost tab
+                // waits up to ~60s for the post to load before reporting back.
+                const maxWaitTime = 90000;
+                const startWait = Date.now();
+
+                while (Date.now() - startWait < maxWaitTime) {
+                    await sleep(150);
+                    const status = getRepostStatus();
+
+                    if (status === 'rate_limited' || localStorage.getItem(RATE_LIMIT_KEY)) {
+                        log('⚠️ Post opening limit / Black screen hit!');
+                        clearRepostStatus();
+                        try { if (tab && !tab.closed) tab.close(); } catch (e) { }
+                        window.focus();
+                        await handle6MinuteRateLimit();
+                        return 'rate_limited';
+                    } else if (status === 'done') {
+                        log('✅ Repost confirmed!');
+                        clearRepostStatus();
+                        stats.reposted++;
+                        savePersistentStats();
+                        updateStats();
+                        window.focus();
+                        return 'done';
+                    } else if (status === 'failed_permanent') {
+                        log('⛔ Post unavailable/deleted/blocked — will not retry.');
+                        clearRepostStatus();
+                        stats.skipped++;
+                        savePersistentStats();
+                        updateStats();
+                        window.focus();
+                        return 'failed_permanent';
+                    } else if (status === 'failed') {
+                        log('⚠️ Repost failed (transient).');
+                        clearRepostStatus();
+                        stats.skipped++;
+                        savePersistentStats();
+                        updateStats();
+                        window.focus();
+                        return 'failed';
+                    }
+                }
+
+                if (localStorage.getItem(RATE_LIMIT_KEY)) {
+                    try { if (tab && !tab.closed) tab.close(); } catch (e) { }
+                    window.focus();
+                    await handle6MinuteRateLimit();
+                    return 'rate_limited';
+                }
+
+                log('⚠️ Repost timeout.');
+                clearRepostStatus();
+                try { if (tab && !tab.closed) tab.close(); } catch (e) { }
+                stats.skipped++;
+                savePersistentStats();
+                updateStats();
+                window.focus();
+                return 'timeout';
+            } catch (e) {
+                clearRepostStatus();
+                return 'failed';
+            }
+        }
+
+        // ---- Repost hardening: never silently skip a repost ----
+        const REPOSTED_URLS_KEY = 'x_chat_bot_reposted_urls';
+        const PENDING_REPOSTS_KEY = 'x_chat_bot_pending_reposts';
+        const DEAD_URLS_KEY = 'x_chat_bot_dead_urls';
+        const MAX_PENDING_RUNS = 3; // a pending tweet is retried on max 3 runs, then dropped
+
+        function loadRepostedUrls() {
+            try {
+                const obj = JSON.parse(localStorage.getItem(REPOSTED_URLS_KEY) || '{}');
+                const cutoff = Date.now() - 30 * 24 * 3600 * 1000;
+                let changed = false;
+                for (const k of Object.keys(obj)) {
+                    if ((obj[k] || 0) < cutoff) { delete obj[k]; changed = true; }
+                }
+                if (changed) localStorage.setItem(REPOSTED_URLS_KEY, JSON.stringify(obj));
+                return obj;
+            } catch (e) { return {}; }
+        }
+        function isTweetReposted(url) {
+            try { return !!loadRepostedUrls()[url]; } catch (e) { return false; }
+        }
+        function isTweetDead(url) {
+            try { return !!(JSON.parse(localStorage.getItem(DEAD_URLS_KEY) || '{}')[url]); }
+            catch (e) { return false; }
+        }
+        function markTweetDead(url) {
+            try {
+                const obj = JSON.parse(localStorage.getItem(DEAD_URLS_KEY) || '{}');
+                obj[url] = Date.now();
+                localStorage.setItem(DEAD_URLS_KEY, JSON.stringify(obj));
+            } catch (e) { }
+        }
+        function markTweetReposted(url) {
+            try {
+                const obj = loadRepostedUrls();
+                obj[url] = Date.now();
+                const keys = Object.keys(obj);
+                if (keys.length > 500) {
+                    keys.sort((a, b) => obj[a] - obj[b]);
+                    for (let i = 0; i < keys.length - 500; i++) delete obj[keys[i]];
+                }
+                localStorage.setItem(REPOSTED_URLS_KEY, JSON.stringify(obj));
+            } catch (e) { }
+        }
+        // Tweets that failed even after retries wait here for the next run.
+        function addPendingRepost(url) {
+            try {
+                const arr = JSON.parse(localStorage.getItem(PENDING_REPOSTS_KEY) || '[]');
+                if (!arr.some(e => e && e.url === url)) {
+                    arr.push({ url: url, ts: Date.now() });
+                    while (arr.length > 50) arr.shift();
+                    localStorage.setItem(PENDING_REPOSTS_KEY, JSON.stringify(arr));
+                    log(`📌 Repost failed 3x — queued for next run.`);
+                }
+            } catch (e) { }
+        }
+        async function processPendingReposts() {
+            let arr = [];
+            try { arr = JSON.parse(localStorage.getItem(PENDING_REPOSTS_KEY) || '[]'); } catch (e) { }
+            const cutoff = Date.now() - 7 * 24 * 3600 * 1000;
+            arr = arr.filter(e => e && e.url && (e.ts || 0) >= cutoff && !isTweetDead(e.url) && !isTweetReposted(e.url));
+            if (!arr.length) {
+                try { localStorage.removeItem(PENDING_REPOSTS_KEY); } catch (e) { }
+                return;
+            }
+            log(`📌 Retrying ${arr.length} pending repost(s) from last run...`);
+            const remaining = [];
+            for (const entry of arr) {
+                if (shouldStop) { remaining.push(entry); continue; }
+                entry.runs = (entry.runs || 0) + 1;
+                const status = await repostWithRetry(entry.url);
+                if (status === 'done') markTweetReposted(entry.url);
+                else if (status === 'failed_permanent') markTweetDead(entry.url);
+                else if (status === 'failed' || status === 'timeout' || status === 'rate_limited') {
+                    if (entry.runs < MAX_PENDING_RUNS) remaining.push(entry);
+                    else log(`🗑️ Dropping pending repost after ${MAX_PENDING_RUNS} runs: ${entry.url}`);
+                }
+                // popup_blocked / capped: environmental — don't queue, don't drop silently
+            }
+            try { localStorage.setItem(PENDING_REPOSTS_KEY, JSON.stringify(remaining)); } catch (e) { }
+        }
+
+        // Shared retry driver: transient failures get up to 3 attempts.
+        // Returns the final status string from openTweet.
+        async function repostWithRetry(url) {
+            let status = 'failed';
+            for (let attempt = 1; attempt <= 3 && !shouldStop; attempt++) {
+                if (attempt > 1) { log(`🔁 Repost retry ${attempt}/3...`); await sleep(2000); }
+                status = await openTweet(url);
+                // Stop retrying on success, permanent failure, or environmental blocks.
+                if (status !== 'failed' && status !== 'timeout') break;
+            }
+            return status;
+        }
+
+        // Ultra-Fast Instant Direct Paste Message Sender
+        async function sendMessage() {
+            const msg = CONFIG.CUSTOM_MESSAGE.trim();
+            if (!msg) return;
+            const composer = await waitFor(SEL.COMPOSER, 1000);
+            if (!composer) return;
+
+            composer.focus();
+
+            // Set value instantly via native prototype descriptor (bypasses letter-by-letter typing)
+            const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set
+                || Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+
+            if (nativeInputValueSetter) {
+                nativeInputValueSetter.call(composer, msg);
+            } else {
+                composer.value = msg;
+            }
+
+            // Dispatch full input & change events instantly to trigger React state update
+            composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertFromPaste', data: msg }));
+            composer.dispatchEvent(new Event('change', { bubbles: true }));
+
+            await sleep(50);
+
+            const sendBtn = deepQuery(SEL.SEND_BTN);
+            if (sendBtn && !sendBtn.disabled) {
+                simulateClick(sendBtn);
+                sendBtn.click();
+                stats.messaged++;
+                log('⚡ Instant message pasted & sent!');
+            } else {
+                composer.dispatchEvent(new KeyboardEvent('keydown', {
+                    key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true
+                }));
+                stats.messaged++;
+                log('⚡ Instant message sent (Enter)');
+            }
+            await sleep(100);
+        }
+
+        // ---- SPA navigation: open a chat directly by URL without a full page
+        // reload (much faster than location.href, and no inbox scrolling needed).
+        function spaNavigate(path) {
+            try {
+                history.pushState({}, '', path);
+                window.dispatchEvent(new PopStateEvent('popstate'));
+            } catch (e) {
+                window.location.href = path;
+            }
+        }
+
+        // Wait until the message list belongs to the newly opened chat
+        // (guards against matching the previous chat's still-mounted list).
+        async function waitForNewChatList(oldEl, timeout = 8000) {
+            const start = Date.now();
+            while (Date.now() - start < timeout) {
+                const el = deepQuery(SEL.MESSAGE_LIST);
+                if (el && el !== oldEl) return el;
+                await sleep(100);
+            }
+            return null;
+        }
+
+        // X's in-app "page doesn't exist" screen (SPA 404) — happens when the
+        // opened URL isn't a real conversation route.
+        function isChat404() {
+            try {
+                const t = (document.body && document.body.innerText || '').toLowerCase();
+                return t.includes('this page doesn') && t.includes('try searching for something else');
+            } catch (e) { return false; }
+        }
+
+        // Try to open a chat URL via SPA navigation; returns the message list
+        // element on success, null if it failed (timeout or X 404 page).
+        async function tryOpenChat(targetUrl) {
+            const oldList = deepQuery(SEL.MESSAGE_LIST);
+            spaNavigate(targetUrl);
+            const msgList = await waitForNewChatList(oldList, 8000);
+            if (!msgList) return null;
+            await sleep(400);
+            if (isChat404()) return null;
+            return deepQuery(SEL.MESSAGE_LIST) || msgList;
+        }
+
+        // Open one chat straight from the DB — no inbox scrolling, no DOM clicking.
+        async function processChatById(user) {
+            const chatId = user.id;
+            const label = user.name || user.username || chatId;
+
+            // Skip chats that failed to open recently this session (avoid hot-looping).
+            const failedAt = sessionFailed.get(chatId);
+            if (failedAt && Date.now() - failedAt < 15 * 60 * 1000) {
+                stats.skipped++;
+                return false;
+            }
+
+            log(`Opening ${label}...`);
+
+            // Prefer the chat's real saved link; fall back to the id-based URL.
+            const targetUrl = user.url || `${BASE_CHAT_PATH}/${chatId}`;
+            let msgList = await tryOpenChat(targetUrl);
+
+            if (!msgList && user.url) {
+                // Saved link failed — one retry with the plain id-based URL.
+                spaNavigate(BASE_CHAT_PATH);
+                await sleep(600);
+                msgList = await tryOpenChat(`${BASE_CHAT_PATH}/${chatId}`);
+            }
+
+            if (!msgList) {
+                // One retry via SPA nav before giving up (no full reload — that would
+                // restart the whole bot; the chat is retried on the next cycle).
+                spaNavigate(BASE_CHAT_PATH);
+                await sleep(600);
+                msgList = await tryOpenChat(targetUrl);
+            }
+
+            if (!msgList) {
+                log(`⚠️ Could not open chat (${label}) — will retry next cycle.`);
+                sessionFailed.set(chatId, Date.now());
+                stats.skipped++;
+                spaNavigate(BASE_CHAT_PATH);
+                await sleep(400);
+                return false;
+            }
+            sessionFailed.delete(chatId);
+
+            await sleep(300);
+            const listNow = deepQuery(SEL.MESSAGE_LIST);
+            const hasContent = listNow && listNow.innerText.trim().length > 10;
+
+            if (!hasContent) {
+                blankChatCount++;
+                if (blankChatCount >= BLANK_CHAT_THRESHOLD) {
+                    triggerRecovery('Blank chats detected');
+                    return false;
+                }
+                stats.skipped++;
+                spaNavigate(BASE_CHAT_PATH);
+                await sleep(300);
+                return false;
+            }
+            blankChatCount = 0;
+            clearRefreshCount();
+            clearUnreadFlag(chatId); // opened => X marks it read
+
+            const lastIsReceived = isLastMessageReceived(user);
+
+            // "Incoming only" toggle: skip chats where we sent the last message.
+            // 7.1 stamped the cooldown here too — without it, a chat with a
+            // stale unread flag gets re-picked (and re-opened) forever.
+            if (CONFIG.UNSEEN_ONLY && !lastIsReceived) {
+                markProcessed(chatId);
+                stats.skipped++;
+                spaNavigate(BASE_CHAT_PATH);
+                await sleep(300);
+                return false;
+            }
+
+            log(`Processing ${label}...`);
+            updateStats();
+
+            if (CONFIG.AUTO_REPOST && lastIsReceived) {
+                const tweets = extractTweets(lastIsReceived);
+                for (const url of tweets) {
+                    if (shouldStop) break;
+                    if (isTweetReposted(url) || isTweetDead(url)) continue;
+                    // Never skip the repost silently: transient failures are
+                    // retried now, then wait in the pending queue for next runs.
+                    // Permanent failures (deleted/blocked) are marked dead.
+                    const status = await repostWithRetry(url);
+                    if (status === 'done') markTweetReposted(url);
+                    else if (status === 'failed_permanent') markTweetDead(url);
+                    else if (status === 'failed' || status === 'timeout' || status === 'rate_limited') addPendingRepost(url);
+                }
+            }
+
+            if (shouldStop) {
+                spaNavigate(BASE_CHAT_PATH);
+                return false;
+            }
+
+            if (CONFIG.SEND_MESSAGE && CONFIG.CUSTOM_MESSAGE) {
+                await sendMessage();
+                markChatInteracted(chatId); // our message sent — never interact twice
+            } else {
+                markChatInteracted(chatId);
+            }
+
+            markProcessed(chatId);
+            markChatHandled(chatId);
+
+            // Refresh this user's DB entry (keeps ordering + names fresh).
+            try {
+                const db = loadUserDB();
+                if (db.users[chatId]) {
+                    db.users[chatId].lastSeen = Date.now();
+                    saveUserDB(db);
+                }
+            } catch (e) { }
+
+            await sleep(150);
+            spaNavigate(BASE_CHAT_PATH);
+            await sleep(400);
+            return true;
+        }
+
+        // "Incoming msgs only" mode: live top-to-bottom sweep of the inbox.
+        // Starts at the top and moves down row by row. For each row it checks
+        // the LIVE unread blue dot (svg[data-icon="icon-circle-fill"]) and
+        // whether we've ever interacted with that chat. The first row with a
+        // dot on a never-interacted chat is cleared fully (open -> repost ->
+        // message), then the sweep restarts at the top since the inbox
+        // reorders. Ends when a full top-to-bottom pass finds nothing new.
+        // Returns the number of chats processed.
+        async function runIncomingOnlySweep() {
+            log('🔵 Incoming-only: sweeping inbox top to bottom for unopened chats...');
+            let done = 0;
+            const sweepSkipped = new Set(); // cooldown/failed this run — don't loop on them
+            while (!shouldStop) {
+                spaNavigate(BASE_CHAT_PATH);
+                await sleep(500);
+                const scroller = await waitForInbox(10000);
+                if (!scroller) {
+                    log('⚠️ Chat panel not found — cannot sweep inbox.');
+                    return done;
+                }
+                try { scroller.scrollTop = 0; } catch (e) {}
+                await sleep(700);
+
+                let target = null;
+                let targetWhy = '';
+                const seen = new Set();
+                let still = 0, lastH = -1;
+                // Scan downward and take the FIRST chat top-to-bottom that
+                // still needs its first interaction: a live blue dot, a stored
+                // unread flag, or never handled at all. Already-interacted
+                // chats are never touched. (The stored flag is trusted here:
+                // the old code overwrote it with the live check on every row,
+                // which erased real unread flags whenever the live check
+                // missed — the "Cleared 0 forever" loop.)
+                while (!shouldStop && !target) {
+                    const rows = findChatRows(); // DOM order = top to bottom
+                    for (const row of rows) {
+                        const id = getChatId(row);
+                        if (!id || seen.has(id) || sweepSkipped.has(id)) continue;
+                        seen.add(id);
+                        let u = loadUserDB().users[id];
+                        if (CONFIG.SKIP_GROUPS && isGroup(row)) continue;
+                        if (u && u.interactedAt) continue; // never interact twice
+                        const dot = hasUnreadDot(row); // live check
+                        if (dot && u) { u.unread = true; } // upgrade only — never wipe the stored flag
+                        const needIt = dot || (u ? needsWork(u) : true);
+                        if (!needIt) continue;
+                        if (!u) {
+                            const db = loadUserDB();
+                            upsertUserFromEl(db, row);
+                            u = db.users[id];
+                        }
+                        target = u;
+                        targetWhy = dot ? '🔵 unread dot' : (u.unread ? '🔵 unread' : 'never handled before');
+                        break;
+                    }
+                    if (target || shouldStop) break;
+                    // Reveal more rows further down.
+                    const h = scroller.scrollHeight;
+                    try { scroller.scrollTop += Math.max(400, scroller.clientHeight * 0.8); } catch (e) {}
+                    await sleep(650);
+                    if (scroller.scrollHeight === h && h === lastH) { if (++still >= 3) break; }
+                    else { still = 0; lastH = scroller.scrollHeight; }
+                }
+                // Persist any unread upgrades from this pass (single write).
+                try { saveUserDB(loadUserDB()); } catch (e) { }
+
+                if (!target) {
+                    log(`✅ Incoming-only sweep complete — no unopened chats left. Cleared ${done}.`);
+                    return done;
+                }
+                log(`📌 Will open: ${((target.name || target.id) || '').slice(0, 28)} (${targetWhy})`);
+
+                if (CONFIG.MAX_CHATS > 0 && processedCount >= CONFIG.MAX_CHATS) {
+                    log(`✅ Reached limit of ${CONFIG.MAX_CHATS}`);
+                    return done;
+                }
+                if (isRateLimited()) {
+                    await handle6MinuteRateLimit();
+                    if (shouldStop) return done;
+                    continue;
+                }
+                if (isPageStuck()) {
+                    saveSettings(); saveState();
+                    location.reload();
+                    return done;
+                }
+                if (isInCooldown(target.id)) {
+                    stats.skipped++;
+                    sweepSkipped.add(target.id);
+                    continue;
+                }
+                try {
+                    const ok = await processChatById(target);
+                    if (ok) {
+                        done++;
+                        stats.processed++;
+                        processedCount = stats.processed;
+                        errorCount = 0;
+                        savePersistentStats();
+                    } else {
+                        sweepSkipped.add(target.id);
+                    }
+                } catch (chatErr) {
+                    stats.skipped++;
+                    savePersistentStats();
+                    sweepSkipped.add(target.id);
+                    errorCount++;
+                    log(`⚠️ Chat error: ${(chatErr && chatErr.message) || chatErr}`);
+                    if (errorCount >= 3) {
+                        triggerRecovery('Multiple consecutive errors');
+                        return done;
+                    }
+                }
+                updateStats();
+                await sleep(150);
+                // Loop back: re-sweep from the top (inbox reorders after
+                // activity, and new messages may have arrived while we worked).
+            }
+            return done;
+        }
+
+        async function start() {
+            if (isRunning) return;
+            isRunning = true;
+            shouldStop = false;
+            // Un-freeze background work (frozen by Stop).
+            window.__xBotHalted = false;
+            errorCount = 0;
+            tweetTabsOpened = 0;
+
+            stats = loadPersistentStats();
+            processedCount = stats.processed;
+
+            CONFIG.CUSTOM_MESSAGE = document.getElementById('customMsg')?.value || '';
+            CONFIG.MAX_CHATS = parseInt(document.getElementById('maxChats')?.value) || 0;
+            CONFIG.AUTO_REPOST = document.getElementById('toggleRepost')?.classList.contains('active') ?? true;
+            CONFIG.SEND_MESSAGE = document.getElementById('toggleMsg')?.classList.contains('active') ?? true;
+            CONFIG.SKIP_GROUPS = document.getElementById('toggleGroups')?.classList.contains('active') ?? true;
+            CONFIG.UNSEEN_ONLY = document.getElementById('toggleUnseen')?.classList.contains('active') ?? false;
+            CONFIG.COOLDOWN_HOURS = parseInt(document.getElementById('cooldown')?.value) || 3;
+
+            document.getElementById('startBtn').disabled = true;
+            document.getElementById('stopBtn').style.display = 'inline-flex';
+
+            const startBtn = document.getElementById('startBtn');
+            startBtn.style.opacity = '0.4';
+            startBtn.style.cursor = 'not-allowed';
+
+            saveSettings();
+
+            try {
+                // Startup gate: the bot only works where the DM inbox exists.
+                // The floating panel shows on every X page, so pressing START
+                // on a tweet/timeline used to fail in a silent 3s retry loop.
+                const onMessagesPage = /^\/(messages(\/|$)|i\/chat(\/|$))/.test(location.pathname);
+                if (!onMessagesPage) {
+                    throw new Error('WRONG PAGE — open https://x.com/messages first, then press START.');
+                }
+                if (!(await waitForInbox(15000))) {
+                    panelFailCount++;
+                    if (panelFailCount >= 3) {
+                        panelFailCount = 0;
+                        throw new Error('Chat panel not found 3x — X changed its layout. Paste this in the console and send me the output: [...document.querySelectorAll("template[shadowrootmode]")].flatMap(t=>[...t.shadowRoot.querySelectorAll("[data-testid]")]).map(e=>e.dataset.testid).filter(t=>/dm|chat|inbox|message|conversation/i.test(t)).join("\\n")');
+                    }
+                    throw new Error('Chat panel not found');
+                }
+                panelFailCount = 0;
+
+                // ---- v9.1: 7.1-style live engine (no pre-scan) ----
+                // The DB loads silently from localStorage — NO scrolling on
+                // START. Each loop reads the LIVE inbox rows top-to-bottom and
+                // takes the first chat that needs work. The inbox scrolls DOWN
+                // only when no visible row needs work; 5 consecutive scrolls
+                // with no new content = bottom reached -> phase change.
+                // ("📇 Build User DB" still does a full scan on demand.)
+                let db = loadUserDB();
+                const acctLabel = '@' + (db.accountName || getOwnHandle() || 'account');
+                const unreadCount = Object.values(db.users).filter(u => u.unread).length;
+                log(`📇 DB ready: ${dbSize(db)} users for ${acctLabel} (🔵 ${unreadCount} unread) — no pre-scan, starting at top.`);
+                updateDbLabel();
+
+                // Retry any reposts that failed on previous runs before the daily queue.
+                await processPendingReposts();
+                if (shouldStop) return;
+
+                // 7.1: always start from the very top, then move down.
+                let scroller = findInboxScroller();
+                try { if (scroller) scroller.scrollTop = 0; } catch (e) { }
+                await sleep(800);
+
+                let done = 0;
+                let noNewChatsCount = 0;
+                let lastScrollHeight = 0;
+                let phase = CONFIG.UNSEEN_ONLY ? 'UNSEEN' : 'ALL';
+                let recheckDone = 0;
+                let topReverified = false;
+
+                while (!shouldStop && noNewChatsCount < 5) {
+                    if (isRateLimited()) {
+                        await handle6MinuteRateLimit();
+                        if (shouldStop) break;
+                    }
+
+                    if (isPageStuck()) {
+                        saveSettings(); saveState();
+                        location.reload();
+                        return;
+                    }
+
+                    if (CONFIG.MAX_CHATS > 0 && processedCount >= CONFIG.MAX_CHATS) {
+                        log(`✅ Reached limit of ${CONFIG.MAX_CHATS}`);
+                        break;
+                    }
+
+                    // 7.1: read the LIVE rows top-to-bottom every pass — the
+                    // inbox reorders after each processed chat, so never trust
+                    // a stale list. Rows are upserted into the DB as seen
+                    // (keeps the export fresh); needsWork() applies the
+                    // never-twice rule ("You: Done" rows never reopen).
+                    const rows = findChatRows();
+                    let targetId = null;
+                    const seenIds = new Set();
+                    for (const row of rows) {
+                        const id = getChatId(row);
+                        if (!id || seenIds.has(id)) continue;
+                        seenIds.add(id);
+                        upsertUserFromEl(db, row);
+                        const u = db.users[id];
+                        if (!u) continue;
+                        if (CONFIG.SKIP_GROUPS && u.isGroup) continue;
+                        if (phase === 'UNSEEN') {
+                            // Phase 1 UNSEEN: process unread (blue-dot) incoming messages ONLY.
+                            const isUnread = !!u.unread || hasUnreadDot(row);
+                            if (!isUnread) continue;
+                        }
+                        if (phase === 'RECHECK' && u.lastMsgMin != null && u.lastMsgMin < 60) continue; // 7.1: skip just-arrived
+                        const targetNeedsWork = (phase === 'ALL') ? (!u.interactedAt || needsWork(u)) : needsWork(u);
+                        if (!targetNeedsWork) continue;
+                        if (isInCooldown(id)) continue;
+                        targetId = id;
+                        break; // top-to-bottom: first match wins
+                    }
+
+                    if (targetId) {
+                        noNewChatsCount = 0;
+                        if (phase === 'RECHECK') recheckDone++;
+                        const user = db.users[targetId];
+                        // 7.1 smooth motion: opening a chat resets the inbox
+                        // to the top — remember where we were and restore it
+                        // afterwards, so the run keeps moving DOWN instead of
+                        // yo-yoing top-to-bottom after every chat.
+                        let resumeTop = 0;
+                        try { const s0 = findInboxScroller(); if (s0) resumeTop = s0.scrollTop; } catch (e) {}
+                        try {
+                            const ok = await processChatById(user);
+                            if (ok) {
+                                done++;
+                                stats.processed++;
+                                processedCount = stats.processed;
+                                errorCount = 0;
+                                savePersistentStats();
+                            }
+                        } catch (chatErr) {
+                            stats.skipped++;
+                            savePersistentStats();
+                            errorCount++;
+                            log(`⚠️ Chat error: ${(chatErr && chatErr.message) || chatErr}`);
+                            if (errorCount >= 3) {
+                                triggerRecovery('Multiple consecutive errors');
+                                return;
+                            }
+                        }
+                        try {
+                            const s1 = findInboxScroller();
+                            if (s1) s1.scrollTop = resumeTop;
+                        } catch (e) {}
+                        for (let w = 0; w < 10 && findChatRows().length === 0; w++) await sleep(200); // rows re-render at restored spot
+                        updateStats();
+                        saveUserDB(db);
+                        await sleep(150);
+                    } else {
+                        // 7.1: nothing to do among the visible rows — scroll
+                        // down for more. Five scrolls with no new content
+                        // means the bottom is reached -> change phase.
+                        log(`Scrolling for more... (${done} processed, Phase: ${phase})`);
+                        scroller = findInboxScroller() || scroller;
+                        if (scroller) {
+                            scroller.scrollTop = scroller.scrollHeight;
+                            await sleep(500);
+                            if (scroller.scrollHeight === lastScrollHeight) {
+                                noNewChatsCount++;
+                            } else {
+                                noNewChatsCount = 0;
+                                lastScrollHeight = scroller.scrollHeight;
+                            }
+                        } else {
+                            noNewChatsCount++;
+                        }
+
+                        if (noNewChatsCount >= 5) {
+                            if (phase === 'UNSEEN') {
+                                phase = 'RECHECK';
+                                log('🔍 Phase 1 complete — re-checking top for leftover unread...');
+                                spaNavigate(BASE_CHAT_PATH);
+                                await sleep(800);
+                                scroller = (await waitForInbox(10000)) || scroller;
+                                if (scroller) { try { scroller.scrollTop = 0; scroller.scrollTo({ top: 0, left: 0, behavior: 'instant' }); } catch (e) { } }
+                                await sleep(500);
+                                lastScrollHeight = 0; noNewChatsCount = 0; recheckDone = 0;
+                            } else if (phase === 'RECHECK') {
+                                if (recheckDone > 0) {
+                                    log(`🔍 Re-verified ${recheckDone} leftover chat(s) — one more top check...`);
+                                    recheckDone = 0;
+                                    spaNavigate(BASE_CHAT_PATH);
+                                    await sleep(800);
+                                    scroller = (await waitForInbox(10000)) || scroller;
+                                    if (scroller) { try { scroller.scrollTop = 0; scroller.scrollTo({ top: 0, left: 0, behavior: 'instant' }); } catch (e) { } }
+                                    await sleep(500);
+                                    lastScrollHeight = 0; noNewChatsCount = 0;
+                                } else {
+                                    log('✅ Unread DMs complete! Turning off Auto-repost & Incoming-only toggles, scrolling back to top to send custom messages to all remaining users...');
+                                    
+                                    // Turn off Auto-repost and Incoming-only UI toggles
+                                    const togRepost = document.getElementById('toggleRepost');
+                                    if (togRepost) togRepost.classList.remove('active');
+                                    const togUnseen = document.getElementById('toggleUnseen');
+                                    if (togUnseen) togUnseen.classList.remove('active');
+
+                                    // Update CONFIG and save settings to localStorage
+                                    CONFIG.AUTO_REPOST = false;
+                                    CONFIG.UNSEEN_ONLY = false;
+                                    saveSettings();
+
+                                    // Transition phase to ALL to process remaining users
+                                    phase = 'ALL';
+                                    spaNavigate(BASE_CHAT_PATH);
+                                    await sleep(1000);
+                                    scroller = (await waitForInbox(10000)) || scroller;
+                                    if (scroller) { try { scroller.scrollTop = 0; scroller.scrollTo({ top: 0, left: 0, behavior: 'instant' }); } catch (e) { } }
+                                    await sleep(800);
+                                    lastScrollHeight = 0;
+                                    noNewChatsCount = 0;
+                                    topReverified = false;
+                                }
+                            } else if (!topReverified) {
+                                topReverified = true;
+                                log('🔍 Re-checking top once...');
+                                spaNavigate(BASE_CHAT_PATH);
+                                await sleep(800);
+                                scroller = (await waitForInbox(10000)) || scroller;
+                                if (scroller) { try { scroller.scrollTop = 0; scroller.scrollTo({ top: 0, left: 0, behavior: 'instant' }); } catch (e) { } }
+                                await sleep(500);
+                                lastScrollHeight = 0; noNewChatsCount = 0;
+                            } else {
+                                break;
+                            }
+                        }
+                    }
+                }
+                saveUserDB(db);
+
+                log(`✅ Finished! Processed ${done} chats this run.`);
+                clearRefreshCount();
+
+            } catch (err) {
+                log(`❌ ${err.message}`);
+                if (/WRONG PAGE|not found 3x/.test(err.message)) noRetry = true;
+            } finally {
+                isRunning = false;
+                if (startBtn) {
+                    startBtn.disabled = false;
+                    startBtn.style.opacity = '1';
+                    startBtn.style.cursor = 'pointer';
+                }
+                document.getElementById('stopBtn').style.display = 'none';
+
+                if (!shouldStop && !noRetry) {
+                    log('🔄 Auto-restart in 3s...');
+                    clearRefreshCount();
+                    setTimeout(() => { if (!shouldStop) start(); }, 3000);
+                } else {
+                    clearState();
+                }
+                noRetry = false;
+            }
+        }
+
+        function stop() {
+            shouldStop = true;
+            isRunning = false;
+            // HARD STOP: freeze ALL background work — the media-blocker
+            // interval, pending auto-restarts, everything. Nothing keeps
+            // running after this except the page's own X code.
+            window.__xBotHalted = true;
+            // Close any repost tab still working in the background.
+            try { if (typeof lastRepostTab !== 'undefined' && lastRepostTab && !lastRepostTab.closed) lastRepostTab.close(); } catch (e) { }
+            try { lastRepostTab = null; } catch (e) { }
+            clearState();
+            clearRefreshCount();
+            log('⏹ Stopped — all background work halted.');
+            const startBtn = document.getElementById('startBtn');
+            if (startBtn) {
+                startBtn.disabled = false;
+                startBtn.style.opacity = '1';
+            }
+            document.getElementById('stopBtn').style.display = 'none';
+        }
+
+        function updateStats() {
+            const prog = document.getElementById('progress');
+            if (prog) prog.textContent = stats.processed;
+            const repost = document.getElementById('statRepost');
+            if (repost) repost.textContent = stats.reposted;
+            const msg = document.getElementById('statMsg');
+            if (msg) msg.textContent = stats.messaged;
+            const skip = document.getElementById('statSkip');
+            if (skip) skip.textContent = stats.skipped;
+        }
+
+        function updateDbLabel() {
+            const el = document.getElementById('dbCount');
+            if (el) {
+                try {
+                    const db = loadUserDB();
+                    el.textContent = dbSize(db);
+                    const btn = document.getElementById('dbCountBtn');
+                    if (btn) btn.title = 'Database for ' + (db.accountName ? '@' + db.accountName : 'this account') + ' — click to view saved users';
+                } catch (e) { }
+            }
+        }
+
+        function renderDbList() {
+            const wrap = document.getElementById('dbList');
+            if (!wrap) return;
+            const db = loadUserDB();
+            const users = Object.values(db.users)
+                .sort((a, b) => (a.name || a.username || a.id).localeCompare(b.name || b.username || b.id));
+            wrap.innerHTML = users.map(u => {
+                const label = escapeHtml(((u.name || '') + ' ' + (u.username || '')).trim() || u.id);
+                return `<div style="padding:3px 8px;font-size:10px;color:#cbd5e1;border-bottom:1px solid rgba(255,255,255,0.05);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${label}${u.isGroup ? ' 👥' : ''}</div>`;
+            }).join('') || '<div style="padding:8px;font-size:10px;color:#6e7681;">DB is empty — click "📇 Build User DB".</div>';
+        }
+
+        function createUI() {
+            const existing = document.getElementById('bot-ui');
+            if (existing) existing.remove();
+
+            const ui = document.createElement('div');
+            ui.id = 'bot-ui';
+            ui.innerHTML = `
+                <style>
+                    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap');
+                    #bot-ui {
+                        position: fixed; top: 16px; right: 16px; z-index: 999999;
+                        width: 320px; font-family: 'Inter', system-ui, sans-serif;
+                        color: #d2e4ea; border-radius: 20px; overflow: hidden;
+                        background: #07090b; border: 1px solid rgba(0, 229, 255, 0.2);
+                        box-shadow: 0 20px 60px -15px rgba(0, 0, 0, 0.7);
+                    }
+                    #bot-ui .hdr {
+                        padding: 16px 18px; display: flex; align-items: center; justify-content: space-between;
+                        background: linear-gradient(135deg, #07090b 0%, #0d1418 100%);
+                        border-bottom: 1px solid rgba(0, 229, 255, 0.15); cursor: move; user-select: none;
+                    }
+                    #bot-ui .hdr-left { display: flex; align-items: center; gap: 10px; }
+                    #bot-ui .hdr-icon {
+                        width: 32px; height: 32px; border-radius: 10px;
+                        background: linear-gradient(135deg, #00e5ff, #0066ff);
+                        display: flex; align-items: center; justify-content: center; font-size: 16px;
+                    }
+                    #bot-ui .hdr-title {
+                        font-size: 14px; font-weight: 900; letter-spacing: 2px;
+                        background: linear-gradient(90deg, #00e5ff, #7dd3fc, #ffffff);
+                        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                    }
+                    #bot-ui .hdr-ver { font-size: 9px; font-weight: 600; color: #6e7681; }
+                    #bot-ui .hdr-btn {
+                        width: 26px; height: 26px; border-radius: 6px;
+                        background: rgba(0, 229, 255, 0.1); border: 1px solid rgba(0, 229, 255, 0.2);
+                        color: #94a3b8; cursor: pointer; display: flex; align-items: center; justify-content: center;
+                    }
+                    #bot-ui .body { padding: 16px; }
+                    #bot-ui .stats-hero {
+                        padding: 18px 14px; border-radius: 14px;
+                        background: linear-gradient(145deg, rgba(0, 229, 255, 0.08), rgba(0, 229, 255, 0.08));
+                        border: 1px solid rgba(0, 229, 255, 0.15); margin-bottom: 14px; text-align: center;
+                    }
+                    #bot-ui .stats-num {
+                        font-size: 48px; font-weight: 900; line-height: 1;
+                        background: linear-gradient(135deg, #00e5ff, #ffffff);
+                        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+                    }
+                    #bot-ui .stats-lbl { font-size: 10px; font-weight: 700; color: #6e7681; text-transform: uppercase; margin-top: 4px; }
+                    #bot-ui .stats-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 12px; }
+                    #bot-ui .stat-box { text-align: center; padding: 8px 4px; border-radius: 8px; background: rgba(0, 0, 0, 0.3); }
+                    #bot-ui .stat-val { font-size: 16px; font-weight: 800; }
+                    #bot-ui .stat-val.green { color: #34d399; }
+                    #bot-ui .stat-val.blue { color: #60a5fa; }
+                    #bot-ui .stat-val.amber { color: #fbbf24; }
+                    #bot-ui .stat-tag { font-size: 8px; font-weight: 700; color: #6e7681; text-transform: uppercase; }
+                    #bot-ui .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
+                    #bot-ui .act-btn {
+                        padding: 10px; border: none; border-radius: 12px; cursor: pointer;
+                        font-size: 12px; font-weight: 700; display: inline-flex; align-items: center; justify-content: center; gap: 4px;
+                    }
+                    #bot-ui .act-start { background: linear-gradient(135deg, #00e5ff, #0090ff); color: #001318; }
+                    #bot-ui .act-stop { background: linear-gradient(135deg, #ef4444, #dc2626); color: #fff; }
+                    #bot-ui .util-row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 12px; }
+                    #bot-ui .util-btn {
+                        padding: 6px; border-radius: 8px; background: rgba(255,255,255,0.04);
+                        border: 1px solid rgba(255,255,255,0.08); color: #94a3b8; font-size: 10px; font-weight: 600; cursor: pointer;
+                    }
+                    #bot-ui .status-strip {
+                        display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+                        border-radius: 10px; background: rgba(0,0,0,0.3); margin-bottom: 14px;
+                    }
+                    #bot-ui .status-pip { width: 8px; height: 8px; border-radius: 50%; background: #10b981; }
+                    #bot-ui .status-txt { font-size: 10px; font-weight: 600; color: #94a3b8; }
+                    #bot-ui .opt-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 0; }
+                    #bot-ui .opt-label { font-size: 11px; font-weight: 600; color: #cbd5e1; }
+                    #bot-ui .tog {
+                        width: 36px; height: 20px; background: #1e293b; border-radius: 10px; position: relative; cursor: pointer;
+                    }
+                    #bot-ui .tog.active { background: #00e5ff; }
+                    #bot-ui .tog::after {
+                        content: ''; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+                        background: #fff; border-radius: 50%; transition: all 0.2s;
+                    }
+                    #bot-ui .tog.active::after { left: 18px; }
+                    #bot-ui .inp-num {
+                        width: 50px; padding: 4px; background: #1e293b; border: 1px solid rgba(255,255,255,0.1);
+                        border-radius: 6px; color: #fff; font-size: 11px; text-align: center;
+                    }
+                    #bot-ui .msg-box {
+                        width: 100%; height: 60px; padding: 8px; background: #1e293b;
+                        border: 1px solid rgba(255,255,255,0.1); border-radius: 10px; color: #fff; font-size: 11px; resize: none;
+                    }
+                </style>
+                <div class="hdr" id="botHeader">
+                    <div class="hdr-left">
+                        <div class="hdr-icon">⚡</div>
+                        <div>
+                            <div class="hdr-title">SUPERBOT X</div>
+                            <div class="hdr-ver">v10.0 · SUPERBOT Engine</div>
+                        </div>
+                    </div>
+                    <button class="hdr-btn" id="minBtn">─</button>
+                </div>
+                <div class="body" id="botBody">
+                    <div class="stats-hero">
+                        <div class="stats-num" id="progress">0</div>
+                        <div class="stats-lbl">Chats Processed</div>
+                        <div class="stats-row">
+                            <div class="stat-box"><div class="stat-val green" id="statRepost">0</div><div class="stat-tag">Reposted</div></div>
+                            <div class="stat-box"><div class="stat-val blue" id="statMsg">0</div><div class="stat-tag">Messaged</div></div>
+                            <div class="stat-box"><div class="stat-val amber" id="statSkip">0</div><div class="stat-tag">Skipped</div></div>
+                        </div>
+                    </div>
+                    <div class="actions">
+                        <button class="act-btn act-start" id="startBtn">⚡ START</button>
+                        <button class="act-btn act-stop" id="stopBtn" style="display:none;">⏹ Stop</button>
+                    </div>
+                    <div class="util-row">
+                        <button class="util-btn" id="clearBtn">🔄 Reset Cooldown</button>
+                        <button class="util-btn" id="clearMemoryBtn">📊 Reset Stats</button>
+                    </div>
+                    <div class="util-row">
+                        <button class="util-btn" id="dbBuildBtn" title="Scan the full inbox once and save all users to the local database">📇 Build User DB</button>
+                        <button class="util-btn" id="dbCountBtn" title="Click to view saved users">👥 <span id="dbCount">0</span> in DB</button>
+                    </div>
+                    <div class="util-row">
+                        <button class="util-btn" id="dbExportBtn" title="Download the user database as JSON (move it to your other computer)">⬇ Export DB</button>
+                        <button class="util-btn" id="dbImportBtn" title="Load a user database JSON file">⬆ Import DB</button>
+                    </div>
+                    <input type="file" id="dbImportInput" accept="application/json,.json" style="display:none;">
+                    <div id="dbListWrap" style="display:none; max-height:170px; overflow-y:auto; margin-bottom:12px; border:1px solid rgba(255,255,255,0.08); border-radius:10px; background:rgba(0,0,0,0.3);">
+                        <div id="dbList"></div>
+                    </div>
+                    <div class="status-strip">
+                        <div class="status-pip"></div>
+                        <span class="status-txt" id="botStatus">SUPERBOT X standing by.</span>
+                    </div>
+                    <div class="opt-row"><span class="opt-label">Limit</span><input type="number" class="inp-num" id="maxChats" value="0" min="0"></div>
+                    <div class="opt-row"><span class="opt-label">🔁 Auto-repost</span><div class="tog active" id="toggleRepost"></div></div>
+                    <div class="opt-row"><span class="opt-label">💬 Custom Message</span><div class="tog active" id="toggleMsg"></div></div>
+                    <div class="opt-row"><span class="opt-label">👥 Skip Groups</span><div class="tog active" id="toggleGroups"></div></div>
+                    <div class="opt-row"><span class="opt-label" title="ON = live top-to-bottom sweep: clears each unopened (blue-dot), never-interacted chat one by one. OFF = process all chats from DB.">📩 Incoming msgs only</span><div class="tog" id="toggleUnseen"></div></div>
+                    <div class="opt-row"><span class="opt-label">⏱ Cooldown (hrs)</span><input type="number" class="inp-num" id="cooldown" value="3" min="0"></div>
+                    <div style="margin-top: 10px;">
+                        <div style="display:flex; justify-content:space-between; font-size:10px; color:#6e7681; margin-bottom:4px;">
+                            <span>Message</span><span id="msgCounter">0/280</span>
+                        </div>
+                        <textarea class="msg-box" id="customMsg" placeholder="Type message..." maxlength="280"></textarea>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(ui);
+
+            document.getElementById('startBtn').addEventListener('click', start);
+            document.getElementById('stopBtn').addEventListener('click', stop);
+            ['toggleRepost', 'toggleMsg', 'toggleGroups', 'toggleUnseen'].forEach(id => {
+                document.getElementById(id).addEventListener('click', function () { this.classList.toggle('active'); });
+            });
+            document.getElementById('customMsg').addEventListener('input', function () {
+                document.getElementById('msgCounter').textContent = `${this.value.length}/280`;
+            });
+            document.getElementById('clearBtn').addEventListener('click', () => {
+                localStorage.removeItem(STORAGE_KEY);
+                localStorage.removeItem('x_rate_limit_timestamp');
+                log('✅ Cooldown & Rate Limit cleared!');
+            });
+            document.getElementById('clearMemoryBtn').addEventListener('click', () => {
+                // v9.0: resets the run stats only (Chats Processed / Reposted /
+                // Messaged / Skipped). The user database, settings and cooldowns
+                // are kept — wiping the DB here forced a full inbox rescan.
+                if (confirm('Reset run stats (Chats Processed / Reposted / Messaged / Skipped)? Your user database, settings and cooldowns are kept.')) {
+                    stats = { processed: 0, skipped: 0, reposted: 0, messaged: 0 };
+                    processedCount = 0;
+                    try { localStorage.removeItem(STATS_KEY); } catch (e) { }
+                    clearState();
+                    updateStats();
+                    log('📊 Stats reset — user database kept.');
+                }
+            });
+            document.getElementById('minBtn').addEventListener('click', () => {
+                const body = document.getElementById('botBody');
+                body.style.display = body.style.display === 'none' ? '' : 'none';
+            });
+
+            // ---- User DB buttons ----
+            document.getElementById('dbBuildBtn').addEventListener('click', async () => {
+                if (isRunning) { log('⏸ Stop the bot first, then build the DB.'); return; }
+                log('📇 Building user DB — scanning full inbox (forced rescan)...');
+                const db = loadUserDB();
+                await fullInboxScan(db);
+                try { sessionStorage.setItem('x_db_scanned_' + userDbKey(), '1'); } catch (e) { }
+                updateDbLabel();
+                log(`📇 Done! ${dbSize(loadUserDB())} users saved to the database.`);
+            });
+            document.getElementById('dbCountBtn').addEventListener('click', () => {
+                const wrap = document.getElementById('dbListWrap');
+                const hidden = wrap.style.display === 'none';
+                if (hidden) renderDbList();
+                wrap.style.display = hidden ? '' : 'none';
+            });
+            document.getElementById('dbExportBtn').addEventListener('click', () => {
+                try {
+                    const db = loadUserDB();
+                    const blob = new Blob([JSON.stringify(db)], { type: 'application/json' });
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = 'superbot-x-db-' + getAccountId() + '.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    setTimeout(() => { try { URL.revokeObjectURL(a.href); } catch (e) { } a.remove(); }, 1500);
+                    log(`📇 DB exported (${dbSize(db)} users). Import it on your other computer.`);
+                } catch (e) { log('⚠️ DB export failed.'); }
+            });
+            document.getElementById('dbImportBtn').addEventListener('click', () => {
+                document.getElementById('dbImportInput').click();
+            });
+            document.getElementById('dbImportInput').addEventListener('change', function () {
+                const f = this.files && this.files[0];
+                if (!f) return;
+                const reader = new FileReader();
+                reader.onload = () => {
+                    try {
+                        const db = JSON.parse(reader.result);
+                        if (db && db.users && typeof db.users === 'object') {
+                            db.v = USER_DB_VERSION;
+                            saveUserDB(db);
+                            updateDbLabel();
+                            log(`📇 DB imported: ${dbSize(db)} users.`);
+                        } else {
+                            log('⚠️ That file is not a valid bot DB.');
+                        }
+                    } catch (e) { log('⚠️ Could not read that DB file.'); }
+                };
+                reader.readAsText(f);
+                this.value = '';
+            });
+
+            let dragging = false, ox, oy;
+            const hdr = document.getElementById('botHeader');
+            hdr.addEventListener('mousedown', e => {
+                if (e.target.tagName === 'BUTTON') return;
+                dragging = true; ox = e.clientX - ui.offsetLeft; oy = e.clientY - ui.offsetTop;
+            });
+            document.addEventListener('mousemove', e => {
+                if (!dragging) return;
+                ui.style.left = (e.clientX - ox) + 'px';
+                ui.style.top = (e.clientY - oy) + 'px';
+            });
+            document.addEventListener('mouseup', () => dragging = false);
+        }
+
+        async function init() {
+            await waitForBody(15000);
+            await sleep(300);
+            createUI();
+            log('⚡ SUPERBOT X v10.0 ready — open https://x.com/messages and press START.');
+            stats = loadPersistentStats();
+            processedCount = stats.processed;
+            updateStats();
+            updateDbLabel();
+
+            const savedSettings = loadSettings();
+            if (savedSettings && Object.keys(savedSettings).length > 0) applySettings(savedSettings);
+
+            const savedState = loadState();
+            if (savedState.isRunning) {
+                processedCount = savedState.processedCount || 0;
+                stats = savedState.stats || { processed: 0, skipped: 0, reposted: 0, messaged: 0 };
+                updateStats();
+                clearState();
+                const inbox = await waitForInbox(15000);
+                if (inbox) start();
+            }
+        }
+
+        init();
+    }
+})();

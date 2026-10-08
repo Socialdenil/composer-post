@@ -1,0 +1,108 @@
+// ==UserScript==
+// @name         X.com Video Card to Normal Post Converter
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Automatically converts X.com / Twitter Video Website Cards (promoted cards with overlay text & destination links) into clean, standard normal video posts.
+// @author       You
+// @match        https://x.com/*
+// @match        https://twitter.com/*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    console.log('[X Video Card Converter] Active — Scanning for card posts...');
+
+    // Function to convert a single card wrapper into a normal video post
+    function convertCardToNormalPost(cardWrapper) {
+        if (!cardWrapper || cardWrapper.dataset.convertedToNormal) return;
+
+        // Check if card contains a video component
+        const videoElem = cardWrapper.querySelector('video');
+        if (!videoElem) return;
+
+        // Mark as processed to prevent infinite re-processing
+        cardWrapper.dataset.convertedToNormal = 'true';
+
+        // Extract media details
+        const videoSrc = videoElem.getAttribute('src') || videoElem.currentSrc || '';
+        const posterUrl = videoElem.getAttribute('poster') || '';
+        
+        // Find existing caption/headline text if needed
+        const headlineSpan = cardWrapper.querySelector('[dir="ltr"] span');
+        const headlineText = headlineSpan ? headlineSpan.innerText.trim() : '';
+
+        console.log('[X Video Card Converter] Converting video card:', { videoSrc, posterUrl, headlineText });
+
+        // Create clean standard native video player container
+        const cleanContainer = document.createElement('div');
+        cleanContainer.className = 'clean-normal-video-container';
+        cleanContainer.style.cssText = `
+            width: 100%;
+            max-width: 504px;
+            border-radius: 16px;
+            overflow: hidden;
+            background-color: #000000;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            margin: 8px 0;
+            position: relative;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+        `;
+
+        // Build standard HTML5 video player with controls
+        const newVideo = document.createElement('video');
+        newVideo.controls = true;
+        newVideo.playsInline = true;
+        newVideo.preload = 'metadata';
+        newVideo.style.cssText = `
+            width: 100%;
+            height: auto;
+            max-height: 520px;
+            display: block;
+            object-fit: contain;
+            background-color: #000;
+        `;
+
+        if (posterUrl) newVideo.poster = posterUrl;
+        if (videoSrc) newVideo.src = videoSrc;
+
+        cleanContainer.appendChild(newVideo);
+
+        // Replace the entire website card wrapper (including the "From domain.com" footer link) with clean video
+        const targetParent = cardWrapper.closest('[data-testid="card.wrapper"]') || cardWrapper;
+        if (targetParent && targetParent.parentNode) {
+            targetParent.parentNode.replaceChild(cleanContainer, targetParent);
+        }
+    }
+
+    // Process all cards currently on the page
+    function scanAndConvertCards() {
+        const cards = document.querySelectorAll('[data-testid="card.wrapper"], [aria-labelledby*="id__"]');
+        cards.forEach(card => convertCardToNormalPost(card));
+    }
+
+    // Run initial scan
+    scanAndConvertCards();
+
+    // Set up MutationObserver to auto-convert dynamic cards loaded on scroll/DMs/feed
+    const observer = new MutationObserver((mutations) => {
+        let shouldScan = false;
+        for (const mutation of mutations) {
+            if (mutation.addedNodes.length > 0) {
+                shouldScan = true;
+                break;
+            }
+        }
+        if (shouldScan) {
+            scanAndConvertCards();
+        }
+    });
+
+    observer.observe(document.body, {
+        childList: true,
+        subtree: true
+    });
+
+})();

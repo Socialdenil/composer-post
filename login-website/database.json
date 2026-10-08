@@ -1,0 +1,25 @@
+{
+  "users": [
+    {
+      "id": "usr_admin_001",
+      "email": "admin@example.com",
+      "fullName": "Alex Morgan",
+      "role": "Security Lead",
+      "passwordHash": "9b099cba1e907e1038f248359118cc9238e532c472c6414433a4cf45dcbe3827",
+      "salt": "aegis_salt_2026",
+      "twoFactorEnabled": true,
+      "createdAt": "2026-10-04T17:30:15.169Z"
+    }
+  ],
+  "sessions": [],
+  "auditLogs": [
+    {
+      "id": "log_001",
+      "userId": "usr_admin_001",
+      "event": "Backend API Initialized",
+      "ip": "127.0.0.1",
+      "timestamp": "2026-10-04T17:30:15.169Z",
+      "status": "Success"
+    }
+  ]
+}
